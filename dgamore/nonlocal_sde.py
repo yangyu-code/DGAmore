@@ -1340,11 +1340,15 @@ def _init_mu_history(starting_iter: int) -> list[float]:
     previous run's :math:`\mu`, and any quantity computed from the global (e.g. the lattice filling in
     :meth:`GreensFunction.get_fill_nonlocal`, which now reads ``self._mu``) would use an inconsistent chemical potential.
     That value is only the starting guess: :func:`calculate_self_energy_q` re-solves it so the starting self-energy has
-    the DMFT lattice filling.
+    the DMFT lattice filling. With ``self_consistency.fix_mu`` the history starts at the DMFT :math:`\mu` in either
+    case, and the previous run's value is not read.
 
     :param starting_iter: The iteration the previous calculation stopped at (0 for a fresh run).
     :return: The single-element chemical-potential history list.
     """
+    if config.self_consistency.fix_mu:
+        config.sys.mu = config.sys.mu_dmft
+        return [config.sys.mu_dmft]
     if starting_iter == 0:
         return [config.sys.mu]
 
@@ -2495,15 +2499,19 @@ def calculate_self_energy_q(
         sigma_my = mpi_dist_fullbz.scatter(sigma_cut.mat if comm.rank == 0 else None)
         del sigma_cut
         mu_previous = mu_history[-1]
-        mu_history[-1] = update_mu(
-            mu_previous, n_dmft, ek, sigma_my, config.sys.beta, smom0, logger=logger, mpi_dist=mpi_dist_fullbz
-        )
+        if not config.self_consistency.fix_mu:
+            mu_history[-1] = update_mu(
+                mu_previous, n_dmft, ek, sigma_my, config.sys.beta, smom0, logger=logger, mpi_dist=mpi_dist_fullbz
+            )
         del sigma_my
         if comm.rank == 0:
-            logger.info(
-                f"Warm start holds the DMFT lattice filling {n_dmft:.6f}: mu re-solved from {mu_previous} to "
-                f"{mu_history[-1]}."
-            )
+            if config.self_consistency.fix_mu:
+                logger.info(f"Warm start keeps mu at the DMFT value {mu_history[-1]} (fix_mu).")
+            else:
+                logger.info(
+                    f"Warm start holds the DMFT lattice filling {n_dmft:.6f}: mu re-solved from {mu_previous} to "
+                    f"{mu_history[-1]}."
+                )
             # only the occupations are needed here: sum the Dyson chunks directly instead of holding a second full-k
             # Green's function on the full DMFT frequency box (tens of GB at production scale)
             _, config.sys.occ, config.sys.occ_k = GreensFunction.get_occupation(
@@ -2648,18 +2656,22 @@ def calculate_self_energy_q(
 
         # every rank solves mu on its momenta of the shared sigma; the moment is fitted on rank 0 alone
         old_mu = mu_history[-1]
-        config.sys.mu = update_mu(
-            old_mu,
-            config.sys.n,
-            config.lattice.hamiltonian.get_ek(),
-            sigma_new.mat[mpi_dist_fullbz.my_slice],
-            config.sys.beta,
-            comm.bcast(sigma_new.fit_smom()[0] if comm.rank == 0 else None, root=0),
-            logger=logger,
-            mpi_dist=mpi_dist_fullbz,
-        )
+        if config.self_consistency.fix_mu:
+            config.sys.mu = old_mu
+        else:
+            config.sys.mu = update_mu(
+                old_mu,
+                config.sys.n,
+                config.lattice.hamiltonian.get_ek(),
+                sigma_new.mat[mpi_dist_fullbz.my_slice],
+                config.sys.beta,
+                comm.bcast(sigma_new.fit_smom()[0] if comm.rank == 0 else None, root=0),
+                logger=logger,
+                mpi_dist=mpi_dist_fullbz,
+            )
         mu_history.append(config.sys.mu)
-        logger.info(f"Updated mu from {old_mu} to {config.sys.mu}.")
+        held = " (fix_mu)" if config.self_consistency.fix_mu else ""
+        logger.info(f"Updated mu from {old_mu} to {config.sys.mu}{held}.")
 
         # new occupation matrix and energies from the new Green's function (outside the asympt region it is the
         # DMFT lattice Green's function); k-distributed, so no rank builds the whole DMFT-box Green's function

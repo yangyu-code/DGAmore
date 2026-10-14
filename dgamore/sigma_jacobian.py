@@ -183,7 +183,8 @@ class ExactJacobian:
 
     One product :math:`J\,\delta x`, the proposal's stages linearized:
 
-    1. rank 0: :math:`\delta\mu = -\partial_x N\cdot\delta x/\partial_\mu N` for the filling ``update_mu`` holds,
+    1. rank 0: :math:`\delta\mu = -\partial_x N\cdot\delta x/\partial_\mu N` for the filling ``update_mu`` holds
+       (:math:`\delta\mu = 0` with ``self_consistency.fix_mu``),
        and :math:`\delta n^{\mathbf{k}} = \frac{1}{\beta}\sum_{\nu}G^{\mathrm{k}}\,\delta x^{\mathrm{k}}
        \,G^{\mathrm{k}} + \kappa^{\mathbf{k}}\,\delta\mu` (its real part for a real dispersion, as the occupation);
     2. node roots: :math:`\delta G^{\mathrm{k}} = G^{\mathrm{k}}(\theta_{\mathrm{core}}\,\delta x^{\mathrm{k}} -
@@ -694,7 +695,8 @@ class ExactJacobian:
         dmu, docc, docc_k = None, None, None
         if comm.rank == 0:
             dn_x = self._occupation_change(dx)
-            dmu = -2.0 * np.trace(dn_x.mean(axis=0)).real / self._dn_dmu
+            # the loop holds mu with fix_mu, so the map has no chemical-potential response
+            dmu = 0.0 if config.self_consistency.fix_mu else -2.0 * np.trace(dn_x.mean(axis=0)).real / self._dn_dmu
             docc_k = dn_x.reshape(self._kappa.shape) + self._kappa * dmu
             docc = docc_k.mean(axis=(0, 1, 2))
         dmu = comm.bcast(dmu, root=0)

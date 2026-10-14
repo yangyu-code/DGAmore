@@ -121,6 +121,7 @@ This section controls the self-consistency cycle.
      mixing_history_length: 3      # int
      previous_sc_path: ""          # str
      use_interpolated_sigma: False # bool
+     fix_mu: False                 # bool
 
 The ``max_iter`` field puts an upper limit on the number of iterations; if the self-energy has not converged by
 then, the loop stops and the program exits. The non-local self-energy is written to the output folder for every
@@ -151,6 +152,16 @@ iterations: the previous run's pairs sample a different map, and seeding a secan
 the new residual and stall at the old solution. Enabling ``use_interpolated_sigma`` makes the cycle start from the
 interpolated self-energy of the previous run, with the interpolation itself configured in the
 :ref:`self-energy interpolation section <self-energy-interpolation>`.
+
+By default the chemical potential is re-solved in every iteration so that the lattice filling stays at the DMFT
+lattice filling, and a resumed run first re-solves its predecessor's :math:`\mu` for that filling. Setting ``fix_mu``
+to ``True`` holds :math:`\mu` at the DMFT value for the whole run instead: there is no re-solve at a warm start and
+none in the loop, a resumed run does not take over its predecessor's :math:`\mu`, the convergence test of
+:math:`\mu` is met trivially, and the exact Jacobian of ``use_exact_jacobian`` holds :math:`\delta\mu = 0`, as the
+map it differentiates does. It is meant for a particle-hole symmetric point at half filling, where :math:`\mu = U/2`
+is exact: inside a Mott gap the filling barely depends on :math:`\mu`, so a target filling a little off one, from the
+statistical noise of the impurity self-energy and the finite frequency box, moves :math:`\mu` across the gap and
+breaks the particle-hole symmetry the solution has.
 
 .. _stabilization:
 

@@ -80,6 +80,19 @@ def test_init_mu_history_from_previous_syncs_global_mu(monkeypatch, tmp_path):
     assert config.sys.mu == previous_mu
 
 
+def test_init_mu_history_fix_mu_holds_the_dmft_mu(monkeypatch, tmp_path):
+    """With fix_mu a fresh and a resumed run both start at the DMFT mu, and the predecessor's mu is not read."""
+    monkeypatch.setattr(config.self_consistency, "fix_mu", True)
+    config.sys.mu, config.sys.mu_dmft = 0.3, 0.5
+    config.self_consistency.previous_sc_path = str(tmp_path)
+    monkeypatch.setattr(np, "load", MagicMock(side_effect=AssertionError("mu_history.npy must not be read")))
+
+    assert _init_mu_history(0) == [0.5]
+    config.sys.mu = 0.3
+    assert _init_mu_history(3) == [0.5]
+    assert config.sys.mu == 0.5
+
+
 def _previous_run_folder(tmp_path, monkeypatch, names, beta=25.0):
     """Creates empty predecessor files and a np.load stub returning a constant self-energy tagged by the file name."""
     config.logger = MagicMock()
@@ -1412,6 +1425,32 @@ def test_warm_start_holds_the_dmft_filling_and_resolves_mu(monkeypatch, tmp_path
     infos = [str(c.args[0]) for c in logger.info.call_args_list]
     assert "Filling of the updated Green's function: 1.000000 (target 0.850000)." in infos  # the stub reports 1.0
     assert built == []  # without the DMFT spectrum no whole-box Green's function is built, only its occupation
+
+
+def test_fix_mu_holds_the_dmft_mu_through_the_warm_start_and_the_loop(monkeypatch, tmp_path):
+    """With fix_mu neither the warm start nor any iteration solves for mu: every proposal and the final config.sys.mu
+    take the DMFT value, although the predecessor ended elsewhere."""
+    run, _, logger = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0)
+    monkeypatch.setattr(config.self_consistency, "fix_mu", True)
+    config.sys.mu, config.sys.mu_dmft = 0.7, 0.5  # the predecessor's mu, the DMFT mu
+    start = SelfEnergy(
+        np.full((1, 1, 1, 16), 0.5 + 0.2j, dtype=np.complex64), (1, 1, 1), has_compressed_q_dimension=True, beta=10.0
+    )
+    monkeypatch.setattr(nonlocal_sde, "get_starting_sigma", lambda default: (start, 3))
+    monkeypatch.setattr(nonlocal_sde, "update_mu", MagicMock(side_effect=AssertionError("mu must not be solved")))
+    fake, proposal_mus = nonlocal_sde.calculate_sigma_proposal, []
+
+    def spy(sigma_in, mu, *args, **kwargs):
+        proposal_mus.append(mu)
+        return fake(sigma_in, mu, *args, **kwargs)
+
+    monkeypatch.setattr(nonlocal_sde, "calculate_sigma_proposal", spy)
+    run()
+    assert proposal_mus == [0.5, 0.5, 0.5]
+    assert config.sys.mu == 0.5
+    infos = [str(c.args[0]) for c in logger.info.call_args_list]
+    assert "Warm start keeps mu at the DMFT value 0.5 (fix_mu)." in infos
+    assert "Updated mu from 0.5 to 0.5 (fix_mu)." in infos
 
 
 def test_dmft_spectrum_builds_and_saves_the_lattice_green_function_once_next_to_a_warm_start(monkeypatch, tmp_path):

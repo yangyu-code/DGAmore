@@ -224,6 +224,7 @@ class ConfigParser:
         conf.mixing_history_length = self._try_parse(section, "mixing_history_length", conf.mixing_history_length)
         conf.previous_sc_path = self._try_parse(section, "previous_sc_path", conf.previous_sc_path)
         conf.use_interpolated_sigma = self._try_parse(section, "use_interpolated_sigma", conf.use_interpolated_sigma)
+        conf.fix_mu = self._try_parse(section, "fix_mu", conf.fix_mu)
 
         return conf
 

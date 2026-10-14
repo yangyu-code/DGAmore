@@ -121,6 +121,11 @@ class SelfConsistencyConfig:
     :ivar int mixing_history_length: Number of past iterations used by the accelerated mixing schemes.
     :ivar str previous_sc_path: Path to a previous self-consistency run to resume from (empty to start fresh).
     :ivar bool use_interpolated_sigma: Whether to resume from the interpolated rather than the raw self-energy.
+    :ivar bool fix_mu: Whether the chemical potential is held at the DMFT value :math:`\mu_{\mathrm{DMFT}}` throughout
+        the run instead of being re-solved for the DMFT lattice filling: no re-solve at a warm start, none in the
+        loop, a resumed run does not take over its predecessor's :math:`\mu`, and the exact Jacobian holds
+        :math:`\delta\mu = 0`. For a particle-hole symmetric half-filled point, where :math:`\mu = U/2` is exact
+        and a Mott gap leaves the filling almost independent of :math:`\mu`.
     :ivar str sigma_iterates_subfolder_name: Subfolder name (under the output path) for the per-iteration
         self-energies the loop writes; the resolved directory is :attr:`OutputConfig.sigma_iterates_path`.
     """
@@ -133,6 +138,7 @@ class SelfConsistencyConfig:
         self.mixing_history_length: int = 3
         self.previous_sc_path: str = ""
         self.use_interpolated_sigma: bool = False
+        self.fix_mu: bool = False
         self.sigma_iterates_subfolder_name: str = "Sigma_Iterates"
 
 
