@@ -416,32 +416,127 @@ def test_self_energy_tail_moment_rejects_orbital_off_diagonal_bilinears():
         get_self_energy_tail_moment(u_loc, v_nonloc, zeros[0, 0, 0], zeros, zeros, zeros)
 
 
-def test_log_tail_moment_hands_the_box_sum_of_the_density_susceptibility_to_the_moment(monkeypatch):
-    """The diagnostic sums chi_ccdd over the bosonic box, adds the disconnected q = 0 product of the densities, and
-    logs the deviation from the DMFT moment, whose SelfEnergy sign is Sigma_inf - smom1 / i nu."""
-    nk, nb, nw, beta = (2, 1, 1), 2, 5, 2.0
+@pytest.mark.parametrize("full_niw_range", [True, False])
+def test_density_correlation_is_the_bosonic_box_sum_unfolded_to_the_full_zone(full_niw_range):
+    """C(q) is (2/beta) sum_w chi_ccee over the bosonic box of the irreducible momenta, unfolded to the full zone, plus
+    the disconnected q = 0 product of the densities; a half bosonic range counts chi(-w) = chi(w)^*."""
+    nk, niw, beta = (4, 4, 1), 3, 2.0
+    config.lattice.nk, config.sys.n_bands, config.sys.beta = nk, 1, beta
+    config.lattice.k_grid = bz.KGrid(nk, symmetries=bz.two_dimensional_square_symmetries())
+    config.sys.occ = np.array([[0.45]], dtype=np.complex128)
+    n_irr = config.lattice.k_grid.nk_irr
+    rng = np.random.default_rng(5)
+    half = rng.standard_normal((n_irr, 1, 1, 1, 1, niw + 1)) + 1j * rng.standard_normal((n_irr, 1, 1, 1, 1, niw + 1))
+    full = np.concatenate((np.conj(half[..., :0:-1]), half), axis=-1)
+    chi = FourPoint(
+        full if full_niw_range else half, SpinChannel.DENS, nk, 1, 0, full_niw_range, has_compressed_q_dimension=True
+    )
+    dist = mpi_utils.MpiDistributor(ntasks=n_irr, comm=create_comm_mock())
+
+    nn_q = nonlocal_sde._density_correlation(chi, dist)
+
+    expected = 2.0 / beta * full.sum(axis=-1).reshape(n_irr)[config.lattice.k_grid.irrk_inv.ravel()]
+    expected[0] += np.prod(nk) * 0.9**2
+    assert nn_q.shape == (*nk, 1, 1)
+    assert np.allclose(nn_q.ravel(), expected)
+
+
+def test_density_correlation_takes_the_density_components_of_every_orbital_pair():
+    """With several orbitals C^q_ce sums chi_ccee, and the disconnected term is n_c n_e of the spin-summed densities."""
+    nk, nb, niw, beta = (2, 1, 1), 2, 2, 3.0
     config.lattice.nk, config.sys.n_bands, config.sys.beta = nk, nb, beta
-    config.output.output_path, config.logger = "/run/dir", MagicMock()
+    config.lattice.k_grid = bz.KGrid(nk, symmetries=[])
     config.sys.occ = np.diag([0.3, 0.6]).astype(np.complex128)
-    config.sys.occ_k = np.broadcast_to(config.sys.occ, (*nk, nb, nb)).copy()
-    chi_mat = np.random.default_rng(4).standard_normal((2, nw, nb * nb, nb * nb))
-    chi = MagicMock()
-    chi.to_full_niw_range.return_value.map_to_full_bz.return_value.to_compound_indices.return_value.mat = chi_mat
-    captured = {}
+    mat = np.random.default_rng(4).standard_normal((2, nb, nb, nb, nb, 2 * niw + 1)).astype(np.complex128)
+    chi = FourPoint(mat, SpinChannel.DENS, nk, 1, 0, has_compressed_q_dimension=True)
 
-    def moment(u_loc, v_nonloc, occ, occ_k, nn_q, force_k):
-        captured["nn_q"] = nn_q
-        return np.zeros((2, nb, nb))
+    nn_q = nonlocal_sde._density_correlation(chi, mpi_utils.MpiDistributor(ntasks=2, comm=create_comm_mock()))
 
-    monkeypatch.setattr(nonlocal_sde.os.path, "exists", MagicMock(return_value=True))
-    monkeypatch.setattr(FourPoint, "load", MagicMock(return_value=chi))
-    monkeypatch.setattr(nonlocal_sde, "get_self_energy_tail_moment", moment)
-    nonlocal_sde._log_tail_moment(None, None, None, MagicMock(smom=(None, -np.eye(nb))))
-
-    expected = 2.0 / beta * chi_mat[:, :, [0, 3]][:, :, :, [0, 3]].sum(axis=1)
+    expected = 2.0 / beta * np.einsum("qccee->qce", mat.sum(axis=-1))
     expected[0] += 2 * np.outer([0.6, 1.2], [0.6, 1.2])
-    assert np.allclose(captured["nn_q"], expected.reshape(*nk, nb, nb))
-    assert "largest deviation 1.0000e+00" in config.logger.info.call_args.args[0]
+    assert np.allclose(nn_q, expected.reshape(*nk, nb, nb))
+
+
+def _dmft_tail(niv: int, beta: float, moment: float, third: float = 0.0) -> SelfEnergy:
+    """A momentum-local self-energy 1.5 + moment / iv + third / (iv)^3 on niv positive frequencies."""
+    iv = 1j * MFHelper.vn(niv, beta)
+    return SelfEnergy((1.5 + moment / iv + third / iv**3)[None, None, None, None, None, :], beta=beta)
+
+
+def test_shell_with_the_tail_moment_carries_the_analytic_coefficient_per_momentum():
+    """With v_tail_shell the shell's nu Im Sigma at large nu is -Sigma_1(k) of exact diagonalization of a ring with
+    a non-local W, while the DMFT donor carries a k-independent 1/iv tail; the padding reads back from the outermost
+    frequency, and the fit of the concatenation's moments matches the concatenation."""
+    n_sites, nb, beta, niv = 4, 1, 1.3, 400
+    rng = np.random.default_rng(0)
+    w_r = rng.uniform(0.5, 2.0, (n_sites, nb, nb))
+    w_r = w_r + w_r.transpose(0, 2, 1)
+    w_r = 0.5 * (w_r + w_r[(-np.arange(n_sites)) % n_sites])
+    hop = np.zeros((n_sites, nb, nb), dtype=np.complex128)
+    hop[1] = -1.0
+    hop[-1] += hop[1].conj().T
+    inputs, reference = _ring_tail_moment_reference(hop, w_r, beta=beta, mu=0.7 * w_r[0].sum())
+    u_loc, v_nonloc = _ring_interactions(w_r)
+    config.sys.beta, config.sys.occ, config.sys.occ_k = beta, inputs["occ"], inputs["occ_k"]
+    config.self_consistency.v_tail_shell, config.logger = True, MagicMock()
+    sigma_dmft = _dmft_tail(niv, beta, 0.8, third=0.05)
+
+    correction = nonlocal_sde._shell_tail_moment(u_loc, v_nonloc, inputs["force_k"], inputs["nn_q"], sigma_dmft)
+    core = SelfEnergy(
+        rng.standard_normal((n_sites, nb, nb, 8)) + 0j, (n_sites, 1, 1), has_compressed_q_dimension=True, beta=beta
+    )
+    offset = rng.standard_normal((n_sites, nb, nb))
+    sigma = core.concatenate_self_energies(sigma_dmft, shell_offset=offset, shell_moment=correction)
+
+    assert np.ptp(reference.real) > 0.1  # the moment depends on the momentum
+    nu = MFHelper.vn(niv, beta)[-1]
+    assert np.allclose(nu * sigma.mat[..., -1].imag, -reference.real, atol=1e-4)
+    read_offset, read_moment = sigma.shell_terms_from(sigma_dmft)
+    assert np.allclose(read_offset, offset) and np.allclose(read_moment, correction)
+    fitted = core.fit_smom_concatenated(sigma_dmft, shell_offset=offset, shell_moment=correction)
+    assert all(np.allclose(a, b, rtol=0.0, atol=1e-12) for a, b in zip(fitted, sigma.fit_smom()))
+    assert "applied to the shell" in config.logger.info.call_args.args[0]
+
+
+def test_shell_tail_moment_without_v_matches_the_dmft_tail_of_the_hubbard_value():
+    """For V = 0 the analytic moment is the k-independent U^2 n(1 - n) the DMFT shell carries, whatever the density and
+    force correlations are, so the correction vanishes."""
+    n_sites, u, n_spin = 4, 3.0, 0.4
+    rng = np.random.default_rng(2)
+    u_loc, v_nonloc = _ring_interactions(np.where(np.arange(n_sites)[:, None, None] == 0, u, 0.0))
+    occ_k = np.full((n_sites, 1, 1, 1, 1), n_spin, dtype=np.complex128)
+    config.sys.occ, config.sys.occ_k = occ_k.mean(axis=(0, 1, 2)), occ_k
+    config.self_consistency.v_tail_shell, config.logger = True, MagicMock()
+    nn_q, force_k = rng.standard_normal((2, n_sites, 1, 1, 1, 1))
+
+    correction = nonlocal_sde._shell_tail_moment(
+        u_loc, v_nonloc, force_k, nn_q, _dmft_tail(200, 2.0, u**2 * n_spin * (1 - n_spin))
+    )
+
+    assert np.allclose(correction, 0.0, atol=1e-5)
+
+
+def test_without_v_tail_shell_the_padding_and_the_proposal_shell_keep_their_bits():
+    """With the option off the shell terms are the plain offset, the moment is only logged, and a concatenation
+    without a moment is the one of before."""
+    rng = np.random.default_rng(3)
+    beta, niv = 2.0, 30
+    donor = _dmft_tail(niv, beta, 0.7)
+    core = SelfEnergy(rng.standard_normal((3, 1, 1, 6)) + 0j, (3, 1, 1), has_compressed_q_dimension=True, beta=beta)
+    offset = rng.standard_normal((3, 1, 1))
+    sigma = core.concatenate_self_energies(donor, shell_offset=offset)
+    config.logger = MagicMock()
+
+    shell_offset, shell_moment = nonlocal_sde._shell_terms(sigma, donor)
+
+    assert np.array_equal(shell_offset, sigma.shell_offset_from(donor)) and shell_moment is None
+    again = core.concatenate_self_energies(donor, shell_offset=shell_offset, shell_moment=None)
+    assert np.array_equal(again.mat, sigma.mat)
+    u_loc, v_nonloc = _ring_interactions(np.ones((3, 1, 1)))
+    config.sys.occ, config.sys.occ_k = np.full((1, 1), 0.4 + 0j), np.full((3, 1, 1, 1, 1), 0.4 + 0j)
+    zeros = np.zeros((3, 1, 1, 1, 1))
+    assert nonlocal_sde._shell_tail_moment(u_loc, v_nonloc, zeros, zeros, donor) is None
+    assert "not applied to the shell" in config.logger.info.call_args.args[0]
 
 
 def _constant_chi(mat: np.ndarray):
@@ -1748,12 +1843,12 @@ def test_bare_vertex_eliashberg_only_proposal_dumps_both_channels_without_a_loca
     monkeypatch.setattr(nonlocal_sde, "create_bubble_tail", lambda *a: MagicMock())
     monkeypatch.setattr(nonlocal_sde, "_monitor_stoner_factor", lambda *a: None)
     monkeypatch.setattr(nonlocal_sde, "create_rpa_susceptibility", lambda *a: SimpleNamespace(channel=a[-1]))
-    monkeypatch.setattr(
-        nonlocal_sde,
-        "_finish_physical_susceptibility",
-        lambda chi, dist, annealer, save, lam, static_magn=None, last_chi=None: steps.append((chi.channel, save))
-        or chi,
-    )
+
+    def finish(chi, dist, annealer, save, lam, static_magn=None, last_chi=None, density_corr=None):
+        steps.append((chi.channel, save))
+        return chi
+
+    monkeypatch.setattr(nonlocal_sde, "_finish_physical_susceptibility", finish)
     args = [MagicMock() for _ in range(8)]  # mu, u_loc, v_nonloc, v_nonloc_full, sigma_dmft, delta_sigma, q list, dist
 
     result = nonlocal_sde.calculate_sigma_proposal(
@@ -1828,6 +1923,33 @@ def _setup_self_energy_loop(monkeypatch, tmp_path, proposal_step, max_iter=10, e
         return nonlocal_sde.calculate_self_energy_q(comm, None, v_nonloc, sigma_dmft, sigma_dmft.copy(), **kwargs)
 
     return run, calls, logger
+
+
+@pytest.mark.parametrize("v", [0.0, 0.3])
+def test_loop_hands_each_proposal_the_force_correlation_of_its_iterate(monkeypatch, tmp_path, v):
+    """With v_tail_shell and V^q != 0 the first proposal gets the force correlation of the starting iterate and every
+    later one that of the iterate the previous occupation update evaluated; for V^q = 0 the option is dropped."""
+    run, _, _ = _setup_self_energy_loop(monkeypatch, tmp_path, lambda s, n, a: s.copy(), max_iter=3, epsilon=0.0, v=v)
+    config.self_consistency.v_tail_shell = True
+    forces, seen = iter(range(1, 10)), []
+    proposal = nonlocal_sde.calculate_sigma_proposal
+    monkeypatch.setattr(nonlocal_sde, "get_self_energy_tail_moment", lambda *a: None)
+    monkeypatch.setattr(nonlocal_sde, "_local_force_k", lambda *a: "start")
+
+    def occupy(*a):
+        if a[5] is not None:
+            a[5][:] = [next(forces)]
+        return 1.0, np.zeros((1, 1)), np.zeros((1, 1, 1, 1, 1)), 0.0, 0.0
+
+    monkeypatch.setattr(nonlocal_sde, "_update_occ_and_energies_distributed", occupy)
+    monkeypatch.setattr(
+        nonlocal_sde, "calculate_sigma_proposal", lambda *a, **k: seen.append(k["force_k"]) or proposal(*a, **k)
+    )
+
+    run()
+
+    assert seen == (["start", 1, 2] if v else [None, None, None])
+    assert config.self_consistency.v_tail_shell == bool(v)
 
 
 @pytest.mark.parametrize("mode", [None, "do_flex", "do_rpa"])
@@ -3386,6 +3508,76 @@ def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(mon
         assert np.array_equal(occ, occ_ref) and np.array_equal(occ_k, occ_k_ref)
         assert np.allclose([ekin, epot], [ekin_ref, epot_ref], atol=1e-5)
         assert np.allclose(force_k, force_k_ref, atol=1e-6)
+
+
+def _two_band_lattice(nk, beta, seed):
+    """Configures a random real two-band dispersion on nk without a point group; returns it."""
+    o, rng = 2, np.random.default_rng(seed)
+    config.sys.beta, config.sys.n_bands, config.lattice.nk = beta, o, nk
+    config.lattice.k_grid = SimpleNamespace(nk_tot=int(np.prod(nk)), nk=nk)
+    ek = rng.standard_normal((*nk, o, o))
+    ek = ek + ek.swapaxes(-1, -2)
+    config.lattice.hamiltonian = MagicMock(get_ek=MagicMock(return_value=ek))
+    return ek
+
+
+def test_local_force_k_matches_the_force_correlation_of_the_tiled_self_energy(monkeypatch):
+    """The fresh start's force correlation of a momentum-local self-energy, distributed over two ranks, equals the
+    force correlation of the self-energy tiled over the grid."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, niv, beta, mu = (4, 2, 1), 8, 9.0, 0.4
+    ek = _two_band_lattice(nk, beta, 21)
+    dmft_mat = np.random.default_rng(22).standard_normal((1, 1, 1, 2, 2, 2 * niv)) * 0.1 + 0.2j
+    tiled = SelfEnergy(np.broadcast_to(dmft_mat, (*nk, 2, 2, 2 * niv)).copy(), nk, beta=beta)
+    giwk = GreensFunction.get_g_full(tiled, mu, ek, beta)
+    giwk.get_fill_nonlocal()
+    reference = giwk.get_force_k()
+    sigmas = [SelfEnergy(dmft_mat.copy(), beta=beta) for _ in range(2)]
+
+    def fn(comm, rank):
+        return nonlocal_sde._local_force_k(sigmas[rank], mu, mpi_utils.MpiDistributor(ntasks=8, comm=comm))
+
+    _, res = run_parallel(2, fn)
+    for force_k in res:
+        assert np.allclose(force_k, reference, atol=1e-8)
+
+
+def test_update_occ_and_energies_extend_the_shell_moment_of_v_tail_shell_to_the_dmft_box(monkeypatch):
+    """With v_tail_shell the DMFT-box extension of the loop's self-energy carries its Hermitian shell offset and its
+    1/iv shell term, read from its outermost frequency, so occupation and force correlation are those of the
+    concatenation with both; dropping the 1/iv term beyond the loop's box changes them."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    nk, niv_core, niv, niv_dmft, beta, mu = (4, 2, 1), 1, 3, 8, 9.0, 0.4
+    ek = _two_band_lattice(nk, beta, 23)
+    config.self_consistency.v_tail_shell = True
+    rng = np.random.default_rng(24)
+    offset, moment = rng.standard_normal((2, 8, 2, 2)) + 1j * rng.standard_normal((2, 8, 2, 2))
+    offset, moment = offset + np.conj(offset.swapaxes(-1, -2)), 3.0 * (moment + np.conj(moment.swapaxes(-1, -2)))
+    core_mat = rng.standard_normal((8, 2, 2, 2 * niv_core)) * 0.1 + 0.3j
+    dmft_mat = rng.standard_normal((1, 1, 1, 2, 2, 2 * niv_dmft)) * 0.1 + 0.2j
+    sigma_dmft_full = SelfEnergy(dmft_mat.copy(), (1, 1, 1), beta=beta)
+
+    def core():
+        return SelfEnergy(core_mat.copy(), nk, has_compressed_q_dimension=True, beta=beta)
+
+    sigma_new = core().concatenate_self_energies(sigma_dmft_full.cut_niv(niv), shell_offset=offset, shell_moment=moment)
+    references = []
+    for shell_moment in (moment, None):
+        full = core().concatenate_self_energies(sigma_dmft_full, shell_offset=offset, shell_moment=shell_moment)
+        giwk = GreensFunction.get_g_full(full, mu, ek, beta)
+        references.append((giwk.get_fill_nonlocal()[2], giwk.get_force_k()))
+    sigmas = [(sigma_new.copy(), sigma_dmft_full.copy()) for _ in range(2)]
+
+    def fn(comm, rank):
+        d_full, force_k = mpi_utils.MpiDistributor(ntasks=8, comm=comm), []
+        occ_k = nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu, None, force_k)[2]
+        return occ_k, force_k[0]
+
+    _, res = run_parallel(2, fn)
+    (occ_k_ref, force_k_ref), (occ_k_cut, force_k_cut) = references
+    assert not np.allclose(force_k_cut, force_k_ref, atol=1e-4)
+    for occ_k, force_k in res:
+        assert np.allclose(occ_k, occ_k_ref, atol=1e-8) and np.allclose(force_k, force_k_ref, atol=1e-8)
 
 
 @pytest.mark.parametrize("size", [1, 3])

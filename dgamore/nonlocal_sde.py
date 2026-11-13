@@ -1243,6 +1243,7 @@ def _finish_physical_susceptibility(
     lambda_previous: dict | None = None,
     static_magn: list | None = None,
     last_chi: dict | None = None,
+    density_corr: list | None = None,
 ) -> FourPoint:
     r"""
     Returns the physical susceptibility the self-energy kernel reads: the annealer's boson mass and the restriction are
@@ -1264,6 +1265,8 @@ def _finish_physical_susceptibility(
         irreducible-BZ :math:`\omega = 0` slice; ``None`` keeps nothing.
     :param last_chi: Holder of the loop's latest physical susceptibility per channel, which the loop writes once
         after its last proposal, or ``None`` to write it in every call.
+    :param density_corr: Holder that receives, for the density channel, the density correlation of the treated
+        susceptibility on rank 0 (see :func:`_density_correlation`; ``None`` elsewhere), or ``None`` to skip it.
     :return: The treated physical susceptibility (rank-local momenta).
     """
     logger = config.logger
@@ -1293,6 +1296,9 @@ def _finish_physical_susceptibility(
         mpi_utils.idle_barrier(mpi_dist_irrq.comm)  # the other ranks sleep while rank 0 corrects and writes
         chi_phys_q_r.mat = mpi_dist_irrq.scatter(chi_phys_q_r.mat)
 
+    if density_corr is not None and chi_phys_q_r.channel == SpinChannel.DENS:
+        density_corr[:] = [_density_correlation(chi_phys_q_r, mpi_dist_irrq)]
+
     _monitor_chi_phys(chi_phys_q_r, mpi_dist_irrq)
 
     if save_eliashberg:
@@ -1319,6 +1325,7 @@ def calculate_sigma_kernel_r_q(
     involution: np.ndarray | None = None,
     static_magn: list | None = None,
     last_chi: dict | None = None,
+    density_corr: list | None = None,
 ) -> FourPoint | None:
     r"""
     Adds the kernel for the self-energy calculation in a specific spin channel, times ``weight``, to ``kernel`` in
@@ -1361,6 +1368,8 @@ def calculate_sigma_kernel_r_q(
         :func:`_finish_physical_susceptibility`), or ``None``.
     :param last_chi: Holder of the loop's latest physical susceptibility per channel (see
         :func:`_finish_physical_susceptibility`), or ``None``.
+    :param density_corr: Holder of the density correlation (see :func:`_finish_physical_susceptibility`), or
+        ``None``.
     :return: ``kernel``.
     """
     logger = config.logger
@@ -1407,6 +1416,7 @@ def calculate_sigma_kernel_r_q(
         lambda_previous=lambda_previous,
         static_magn=static_magn,
         last_chi=last_chi,
+        density_corr=density_corr,
     )
     parts = (gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc, chi_shell, chi_phys_q_r)
 
@@ -2481,45 +2491,126 @@ def _share_sigma_per_node(
     return sigma, win
 
 
-def _log_tail_moment(
-    u_loc: LocalInteraction, v_nonloc: Interaction, force_k: np.ndarray, sigma_dmft: SelfEnergy
-) -> None:
+def _density_correlation(chi_dens: FourPoint, mpi_dist_irrq: MpiDistributor) -> np.ndarray | None:
     r"""
-    Logs the analytic tail coefficient :math:`\Sigma_1(\mathbf{k})` of :func:`get_self_energy_tail_moment` next to the
-    k-independent one the DMFT shell carries. The density correlation is the box frequency sum of this iteration's
-    lambda-corrected density susceptibility, the sum its sum rule fixes; no tail is extrapolated, since the corrected
-    susceptibility need not decay as :math:`\omega^{-2}` inside the box. Diagnostic only; skipped without the
-    susceptibility file or for an unsupported interaction.
+    Returns the density correlation :math:`C^{\mathbf{q}}_{ce}` that :func:`get_self_energy_tail_moment` reads, from
+    the density susceptibility the self-energy kernel reads: the box frequency sum
+    :math:`\tfrac{2}{\beta}\sum_\omega \chi^{\omega\mathbf{q}}_{d;ccee}` plus the disconnected
+    :math:`N\delta_{\mathbf{q}0}\langle n_c\rangle\langle n_e\rangle` of ``config.sys.occ``. No tail beyond the
+    bosonic box is added (it would be added to ``box`` here), so without a lambda correction the sum misses part of its
+    sum rule. Every rank sums its momenta, rank 0 gathers the sums and unfolds them to the full BZ, orbital rotations
+    included (the frequency sum commutes with the unfold). Collective over the communicator of ``mpi_dist_irrq``.
+
+    :param chi_dens: The density susceptibility ``[q, o1, o2, o3, o4, w]`` on this rank's irreducible momenta; only
+        read.
+    :param mpi_dist_irrq: MPI distributor over the irreducible BZ q-points (see :class:`MpiDistributor`).
+    :return: :math:`C^{\mathbf{q}}` ``[qx, qy, qz, c, e]`` on rank 0; ``None`` elsewhere.
+    """
+    nb, nk, beta = config.sys.n_bands, config.lattice.nk, config.sys.beta
+    mat = chi_dens.mat.reshape(-1, nb, nb, nb, nb, chi_dens.mat.shape[-1])
+    box = mat.sum(axis=-1)
+    if not chi_dens.full_niw_range:  # chi(-w) = chi(w)^* element-wise, see LocalNPoint.to_full_niw_range
+        box = box + np.conj(box - mat[..., 0])
+    box = mpi_dist_irrq.gather(box[..., None])
+    if box is None:
+        return None
+    box = FourPoint(box, SpinChannel.DENS, nk, 1, 0, has_compressed_q_dimension=True)
+    box = box.map_to_full_bz(config.lattice.k_grid).mat[..., 0]
+    nn_q = 2.0 / beta * np.einsum("qccee->qce", box)
+    n_orb = 2.0 * np.real(np.diagonal(config.sys.occ))
+    nn_q[0] += np.prod(nk) * np.outer(n_orb, n_orb)
+    return nn_q.reshape(*nk, nb, nb)
+
+
+def _shell_tail_moment(
+    u_loc: LocalInteraction, v_nonloc: Interaction, force_k: np.ndarray, nn_q: np.ndarray, sigma_dmft: SelfEnergy
+) -> np.ndarray | None:
+    r"""
+    Returns the correction :math:`\Sigma_1(\mathbf{k}) - \Sigma_1^{\mathrm{DMFT}}` the shell of a proposal carries as
+    ``shell_moment`` (see :meth:`SelfEnergy.concatenate_self_energies`) with ``config.self_consistency.v_tail_shell``,
+    so that its :math:`1/\imath\nu` coefficient is the analytic one of :func:`get_self_energy_tail_moment` while its
+    higher orders stay the DMFT ones. The moment is evaluated on the iterate the proposal is computed from, like the
+    :math:`V^{\mathbf{q}}` Hartree-Fock term: its occupations (``config.sys.occ``, ``occ_k``), its force correlation and
+    the density correlation of the proposal's own density susceptibility (see :func:`_density_correlation`). Logs
+    :math:`\Sigma_1(\mathbf{k})`, the DMFT coefficient, the correction and the momentum average of the density
+    correlation, :math:`\langle n_c^2\rangle` if exact, next to :math:`\langle n_c\rangle`. Without the option it only
+    logs (a diagnostic); an unsupported interaction is then skipped.
 
     :param u_loc: The bare local interaction :math:`U`.
     :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` on the full q-grid.
-    :param force_k: The k-resolved force correlation ``[kx, ky, kz, o1, o2]``.
+    :param force_k: The iterate's k-resolved force correlation ``[kx, ky, kz, o1, o2]`` (see
+        :meth:`GreensFunction.get_force_k`).
+    :param nn_q: The density correlation ``[qx, qy, qz, o1, o2]`` of :func:`_density_correlation`.
     :param sigma_dmft: The DMFT :class:`SelfEnergy` supplying the shell.
-    :return: None.
+    :return: The correction ``[k, o1, o2]`` (compressed momenta) with the option; ``None`` without it.
+    :raises NotImplementedError: With the option, for an interaction :func:`get_self_energy_tail_moment` rejects.
     """
-    path = os.path.join(config.output.output_path, "chi_phys_q_dens.npy")
-    if not os.path.exists(path):
-        return
-    nk, nb, beta = config.lattice.nk, config.sys.n_bands, config.sys.beta
-    chi = FourPoint.load(path, SpinChannel.DENS, num_vn_dimensions=0, has_compressed_q_dimension=True, nq=nk)
-    chi = chi.to_full_niw_range().map_to_full_bz(config.lattice.k_grid).to_compound_indices().mat  # [q, w, ab, cd]
-    dens = np.arange(nb) * (nb + 1)  # compound index of the density aa
-    nn_q = 2.0 / beta * chi[..., dens[:, None], dens[None, :]].sum(axis=1)  # chi_{ccdd} summed over w, [q, c, d]
-    n_orb = 2.0 * np.real(np.diagonal(config.sys.occ))
-    nn_q[0] += np.prod(nk) * np.outer(n_orb, n_orb)
+    nb = config.sys.n_bands
+    apply = config.self_consistency.v_tail_shell
     try:
-        sigma_1 = get_self_energy_tail_moment(
-            u_loc, v_nonloc, config.sys.occ, config.sys.occ_k, nn_q.reshape(*nk, nb, nb), force_k
-        )
+        sigma_1 = get_self_energy_tail_moment(u_loc, v_nonloc, config.sys.occ, config.sys.occ_k, nn_q, force_k)
     except NotImplementedError as error:
+        if apply:
+            raise
         config.logger.info(f"Tail moment diagnostic skipped: {error}")
-        return
+        return None
     shell = -sigma_dmft.smom[1]  # the SelfEnergy moments are Sigma_inf - smom1 / i nu
+    correction = sigma_1 - shell
     diagonal = np.real(np.diagonal(sigma_1, axis1=-2, axis2=-1))
+    shift = np.real(np.diagonal(correction, axis1=-2, axis2=-1))
+    nn_loc = np.real(np.diagonal(nn_q.reshape(-1, nb, nb).mean(axis=0)))
+    corrected = config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction
     config.logger.info(
         f"Tail moment Sigma_1(k): diagonal in [{diagonal.min():.4f}, {diagonal.max():.4f}], DMFT shell "
-        f"{np.real(np.diagonal(shell)).round(4)}, largest deviation {np.abs(sigma_1 - shell).max():.4e}."
+        f"{np.real(np.diagonal(shell)).round(4)}, correction diagonal in [{shift.min():.4f}, {shift.max():.4f}] "
+        f"(largest element {np.abs(correction).max():.4e}, {'applied to' if apply else 'not applied to'} the shell); "
+        f"density correlation N^-1 sum_q C(q) = {nn_loc.round(4)} against n = "
+        f"{(2.0 * np.real(np.diagonal(config.sys.occ))).round(4)} "
+        f"({'lambda-corrected' if corrected else 'bare'} density susceptibility, box sum)."
     )
+    return correction if apply else None
+
+
+def _shell_terms(sigma: SelfEnergy, donor: SelfEnergy) -> tuple[np.ndarray, np.ndarray | None]:
+    r"""
+    Returns the ``shell_offset`` and ``shell_moment`` (see :meth:`SelfEnergy.concatenate_self_energies`) that
+    ``sigma`` carries on top of its momentum-local shell donor: with ``config.self_consistency.v_tail_shell`` the
+    constant and the :math:`1/\imath\nu` coefficient of :meth:`SelfEnergy.shell_terms_from`, otherwise the offset of
+    :meth:`SelfEnergy.shell_offset_from` and ``None``, bit for bit the padding without the option.
+
+    :param sigma: The self-energy whose outermost frequency lies in its padded shell.
+    :param donor: The momentum-local shell donor.
+    :return: The tuple ``(shell_offset, shell_moment)``, each ``[q, o1, o2]`` (compressed momenta) or the moment
+        ``None``.
+    """
+    if config.self_consistency.v_tail_shell:
+        return sigma.shell_terms_from(donor)
+    return sigma.shell_offset_from(donor), None
+
+
+def _local_force_k(sigma: SelfEnergy, mu: float, mpi_dist_fullbz: MpiDistributor) -> np.ndarray:
+    r"""
+    Returns the k-resolved force correlation (see :meth:`GreensFunction.get_force_k`) of a momentum-local
+    self-energy, the fresh start's DMFT one, on its whole frequency box: every rank builds the Green's function of its
+    momenta and the force correlations are assembled like the occupation (see :func:`_assemble_occupation`).
+    Collective over the communicator of ``mpi_dist_fullbz``.
+
+    :param sigma: The momentum-local :class:`SelfEnergy` (full fermionic range, moments fitted).
+    :param mu: Chemical potential :math:`\mu`.
+    :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
+    :return: The force correlation ``[kx, ky, kz, o1, o2]`` of the correlated orbitals on every rank.
+    """
+    ek = config.lattice.hamiltonian.get_ek()
+    n_orbitals, n_my, nb = ek.shape[-1], mpi_dist_fullbz.my_size, config.sys.n_bands
+    force_slice = np.zeros((0, 1, 1, nb, nb))
+    if n_my:
+        ek_my = ek.reshape(-1, n_orbitals, n_orbitals)[mpi_dist_fullbz.my_slice]
+        ek_my = ek_my.reshape(n_my, 1, 1, n_orbitals, n_orbitals)
+        giwk = GreensFunction.get_g_full(sigma, mu, ek_my, config.sys.beta, orbitals=config.sys.correlated_orbitals)
+        giwk.get_fill_nonlocal(real_dispersion=np.isrealobj(np.real_if_close(ek)))
+        force_slice = giwk.get_force_k()
+        giwk.free()
+    return _assemble_occupation(force_slice, mpi_dist_fullbz)[2]
 
 
 def _occupation_self_energy(
@@ -2531,8 +2622,9 @@ def _occupation_self_energy(
     r"""
     Returns this rank's momentum slice of the self-energy the occupation is evaluated with: ``sigma_new`` on its own
     frequency box and the DMFT self-energy beyond it, shifted by the momentum-dependent shell offset ``sigma_new``
-    carries (see :meth:`SelfEnergy.shell_offset_from`), with the high-frequency moments of the whole concatenation
-    fitted on rank 0 and broadcast.
+    carries (see :meth:`SelfEnergy.shell_offset_from`) and, with ``config.self_consistency.v_tail_shell``, by its
+    momentum-dependent :math:`1/\imath\nu` shell term (see :func:`_shell_terms`), with the high-frequency moments of
+    the whole concatenation fitted on rank 0 and broadcast.
 
     :param sigma_new: The mixed :class:`SelfEnergy` (full BZ, identical on every rank; compressed in place).
     :param sigma_dmft_full: The DMFT :class:`SelfEnergy` supplying the shell frequencies (momentum-local).
@@ -2545,13 +2637,17 @@ def _occupation_self_energy(
     sigma_slice = SelfEnergy(
         mat, (len(mat), 1, 1), has_compressed_q_dimension=True, calc_smom=False, beta=config.sys.beta
     )
-    shell_offset = sigma_new.shell_offset_from(sigma_dmft_full)
-    sigma_occ = sigma_slice.concatenate_self_energies(sigma_dmft_full, shell_offset=shell_offset[rows])
+    shell_offset, shell_moment = _shell_terms(sigma_new, sigma_dmft_full)
+    sigma_occ = sigma_slice.concatenate_self_energies(
+        sigma_dmft_full,
+        shell_offset=shell_offset[rows],
+        shell_moment=None if shell_moment is None else shell_moment[rows],
+    )
 
     # the full-box moments come from the k-mean fit window of the replicated sigma_new, so rank 0 fits them once
     # (the fit window is a full-BZ array) and broadcasts; the fit equals the momentum-resolved concatenation's fit
     moments = (
-        sigma_new.fit_smom_concatenated(sigma_dmft_full, shell_offset=shell_offset)
+        sigma_new.fit_smom_concatenated(sigma_dmft_full, shell_offset=shell_offset, shell_moment=shell_moment)
         if mpi_dist_fullbz.my_rank == 0
         else None
     )
@@ -2762,6 +2858,7 @@ def _finish_proposal_on_node(
     average: bool,
     node_comm,
     unfold: bool = False,
+    shell_moment: np.ndarray | None = None,
 ) -> tuple[SelfEnergy | None, float | None]:
     r"""
     Concatenates rank 0's core-box proposal with its shell donor (see :meth:`SelfEnergy.concatenate_self_energies`),
@@ -2783,6 +2880,8 @@ def _finish_proposal_on_node(
         are unfolded from their irreducible momenta before the average, so they obey it without rounding on every
         momentum; a core that does not obey the group, e.g. through a local term that breaks it, is kept. Only read
         on rank 0.
+    :param shell_moment: The :math:`1/\imath\nu` shell coefficient ``[q, o1, o2]`` on rank 0 (see
+        :meth:`SelfEnergy.concatenate_self_energies`), or ``None``; ignored elsewhere.
     :return: The tuple ``(sigma, removed)`` of rank 0's private full-box proposal (compressed momentum axis) and the
         largest change of the average (``None`` without it); ``(None, None)`` on every other rank.
     """
@@ -2792,8 +2891,10 @@ def _finish_proposal_on_node(
     if root:
         core = core.compress_q_dimension()
         mat, core.mat = core.mat, None
-    blob = pickle.dumps((core, donor, shell_offset, average, unfold, mat.shape, mat.dtype)) if root else None
-    core, donor, shell_offset, average, unfold, shape, dtype = pickle.loads(node_comm.bcast(blob, root=0))
+    blob = None
+    if root:
+        blob = pickle.dumps((core, donor, shell_offset, shell_moment, average, unfold, mat.shape, mat.dtype))
+    core, donor, shell_offset, shell_moment, average, unfold, shape, dtype = pickle.loads(node_comm.bcast(blob, root=0))
     core_mat, core_win = mpi_utils.allocate_node_shared_array(node_comm, shape, dtype)
     if root and core_win is None:
         core_mat = mat
@@ -2807,7 +2908,9 @@ def _finish_proposal_on_node(
     out, out_win = mpi_utils.allocate_node_shared_array(node_comm, (*shape[:-1], n_v), dtype)
     size, rank = (node_comm.Get_size(), node_comm.Get_rank()) if out_win is not None else (1, 0)
     mine = slice(rank * n_v // size, (rank + 1) * n_v // size)
-    sigma = core.concatenate_self_energies(donor, shell_offset=shell_offset, out=out, frequencies=mine)
+    sigma = core.concatenate_self_energies(
+        donor, shell_offset=shell_offset, out=out, frequencies=mine, shell_moment=shell_moment
+    )
     if out_win is not None:
         node_comm.Barrier()
     # rank 0 fits the moments on the whole concatenation, before the average changes it, as a single build does
@@ -2849,6 +2952,7 @@ def calculate_sigma_proposal(
     lambda_previous: dict | None = None,
     static_magn: list | None = None,
     last_chi: dict | None = None,
+    force_k: np.ndarray | None = None,
 ) -> SelfEnergy | None:
     r"""
     Returns the raw (un-mixed) DGA self-energy proposal :math:`S(\Sigma_{\mathrm{in}})` at chemical potential
@@ -2905,10 +3009,16 @@ def calculate_sigma_proposal(
         :func:`_finish_physical_susceptibility`), or ``None``.
     :param last_chi: Holder of the loop's latest physical susceptibility per channel (see
         :func:`_finish_physical_susceptibility`), or ``None``.
+    :param force_k: The force correlation ``[kx, ky, kz, o1, o2]`` of ``sigma_in`` (see
+        :meth:`GreensFunction.get_force_k`) on every rank, or ``None``: with it the analytic :math:`1/\imath\nu`
+        coefficient of the proposal is evaluated and logged and, with ``config.self_consistency.v_tail_shell``, carried
+        by its shell (see :func:`_shell_tail_moment`).
     :return: The raw full-BZ proposal :class:`SelfEnergy` (DMFT tail attached) on rank 0; ``None`` on every other rank,
         since only rank 0 mixes it, and on every rank with ``eliashberg_only``.
     """
     logger = config.logger
+    # the density correlation of this proposal's density susceptibility, for the 1/iv coefficient of its shell
+    density_corr = [] if force_k is not None and not eliashberg_only else None
 
     giwk_full, giwk_win, shared_node_comm = _build_giwk_full(
         comm, sigma_in, mu, config.lattice.hamiltonian.get_ek(), config.sys.beta
@@ -2979,6 +3089,7 @@ def calculate_sigma_proposal(
                 lambda_previous,
                 static_magn=static_magn,
                 last_chi=last_chi,
+                density_corr=density_corr,
             )
             if kernel is not None:
                 kernel.add(calculate_rpa_kernel_r_q(chi_q_r, v_nonloc, u_loc).scale(weight), copy=False)
@@ -3037,6 +3148,7 @@ def calculate_sigma_proposal(
             kernel=kernel,
             involution=involution,
             last_chi=last_chi,
+            density_corr=density_corr,
         )
         gamma_dens.mat = None
         if gamma_dens_win is None:
@@ -3105,7 +3217,7 @@ def calculate_sigma_proposal(
         shared_node_comm.Free()
         return None
 
-    donor = shell_offset = None
+    donor = shell_offset = shell_moment = None
     average = False
     if comm.rank == 0:
         sigma_prop = sigma_prop.ifft().to_full_niv_range()
@@ -3124,6 +3236,9 @@ def calculate_sigma_proposal(
         # self-energy calculated in this code and add the smooth dmft self-energy
         sigma_prop += delta_sigma
         donor, shell_offset = sigma_dmft, (hartree_v + fock_v)[..., 0]
+        if density_corr is not None:
+            # the 1/iv coefficient of the same iterate the V^q Hartree-Fock offset above is evaluated on
+            shell_moment = _shell_tail_moment(u_loc, v_nonloc_full, force_k, density_corr[0], sigma_dmft)
         if config.misc.do_rpa:
             # RPA mode carries no DMFT self-energy: its shell is the whole Hartree-Fock term and the kernels' 1/iv tail
             donor, shell_offset = _rpa_shell_donor(tail_moment, sigma_dmft.niv), (hartree + fock)[..., 0]
@@ -3132,7 +3247,9 @@ def calculate_sigma_proposal(
     # a grid whose contraction averages over a point group gets the core of a proposal that obeys the group unfolded
     # from its irreducible momenta, which removes the rounding of the transforms and of the terms added on rank 0
     unfold = comm.rank == 0 and config.lattice.k_grid.auto_point_group() is not None
-    sigma_prop, removed = _finish_proposal_on_node(sigma_prop, donor, shell_offset, average, shared_node_comm, unfold)
+    sigma_prop, removed = _finish_proposal_on_node(
+        sigma_prop, donor, shell_offset, average, shared_node_comm, unfold, shell_moment
+    )
     shared_node_comm.Free()
     if comm.rank != 0:
         return None
@@ -3588,7 +3705,8 @@ def calculate_self_energy_q(
     accelerated-mixing history. With ``config.stabilization.use_exact_jacobian`` a requested exact check
     (:func:`_run_exact_check`) runs before the step, and a pure fixed point gets the exact leading eigenpairs
     (:func:`_install_exact_jacobian`). A non-zero :math:`V^{\mathbf{q}}` is warned about once, since its Hartree-Fock
-    shell offset lies outside the tracked window.
+    shell offset lies outside the tracked window, as does the :math:`1/\imath\nu` shell coefficient of
+    ``config.self_consistency.v_tail_shell`` (see :func:`_shell_tail_moment`), which is warned about too.
 
     Convergence is declared once three residuals lie below epsilon, together with a settled chemical potential: the
     post-mixing step residual (scaled by :math:`p / p_{\mathrm{eff}}` for a damped step of a tracked run), the
@@ -3790,11 +3908,33 @@ def calculate_self_energy_q(
             f"from every iterate's occupations, while the tracker records the core window alone{held}, so the "
             "measured spectrum and the one in jacobian.npz leave out its feedback."
         )
-    # the V^q tail-moment diagnostic reads the lambda-corrected density susceptibility file of each iteration
-    lambda_on = config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction
+    # with V^q != 0 (not in RPA mode) every proposal evaluates the analytic 1/iv coefficient of its iterate from the
+    # iterate's force correlation and its own density susceptibility, lambda-corrected or not, and logs it; the shell
+    # carries it with v_tail_shell
     tail_diagnostic = comm.bcast(
-        comm.rank == 0 and lambda_on and not config.misc.do_rpa and bool(np.any(v_nonloc.mat)), root=0
+        comm.rank == 0 and not config.misc.do_rpa and bool(np.any(v_nonloc.mat)), root=0
     )
+    if config.self_consistency.v_tail_shell and not tail_diagnostic:
+        logger.info("v_tail_shell is ignored: V^q vanishes or RPA mode is on, so the shell keeps the DMFT 1/iv tail.")
+        config.self_consistency.v_tail_shell = False
+    if config.self_consistency.v_tail_shell:
+        unsupported = None
+        if comm.rank == 0:
+            zeros = np.zeros((*config.lattice.nk, config.sys.n_bands, config.sys.n_bands))
+            try:
+                get_self_energy_tail_moment(u_loc, v_nonloc, zeros[0, 0, 0], zeros, zeros, zeros)
+            except NotImplementedError as error:
+                unsupported = str(error)
+        unsupported = comm.bcast(unsupported, root=0)
+        if unsupported is not None:
+            raise NotImplementedError(f"v_tail_shell: {unsupported}")
+        if config.stabilization.use_jacobian_stabilization and comm.rank == 0:
+            held = " and the exact Jacobian holds it fixed" if config.stabilization.use_exact_jacobian else ""
+            logger.warning(
+                "Jacobian stabilization with v_tail_shell: the 1/iv coefficient of the shell is recomputed from every "
+                f"iterate like the V^q Hartree-Fock offset, while the tracker records the core window alone{held}, so "
+                "the measured spectrum and the one in jacobian.npz leave out its feedback."
+            )
     v_nonloc = scatter_irreducible_interaction(v_nonloc, mpi_dist_irrk)
     # the operator arguments of both exact-Jacobian helpers after the iterate and its mu
     exact_args = (u_loc, v_nonloc, v_nonloc_full, sigma_dmft_full, mpi_dist_irrk, mpi_dist_fullbz, comm, chunk_budgets)
@@ -3818,6 +3958,19 @@ def calculate_self_energy_q(
     saver = ThreadPoolExecutor(max_workers=1) if comm.rank == 0 else None
     saving = None
     last_iter = starting_iter + config.self_consistency.max_iter
+    # the force correlation of the iterate the next proposal is computed from (every rank); the loop takes it from its
+    # occupation update, the first proposal's from the starting iterate: the DMFT one of a fresh start, or the
+    # resumed iterate with its plain DMFT shell
+    force_k = None
+    if config.self_consistency.v_tail_shell:
+        if warm_start:
+            holder = []
+            _update_occ_and_energies_distributed(
+                sigma_old, sigma_dmft_full, mpi_dist_fullbz, mu_history[-1], None, holder
+            )
+            force_k = holder[0]
+        else:
+            force_k = _local_force_k(sigma_dmft_full, mu_history[-1], mpi_dist_fullbz)
     for current_iter in range(starting_iter + 1, last_iter + 1):
         logger.info("----------------------------------------")
         logger.info(f"Starting iteration {current_iter}.")
@@ -3855,6 +4008,7 @@ def calculate_self_energy_q(
             lambda_previous=lambda_previous,
             static_magn=static_magn,
             last_chi=last_chi,
+            force_k=force_k,
         )
         # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
         # the map's own distance from a fixed point and the change of the proposal, read before the mixing overwrites it
@@ -3893,7 +4047,7 @@ def calculate_self_energy_q(
         if comm.rank == 0 and config.misc.do_rpa:
             # RPA mode pads with its own tail again, whose moments the outermost frequency holds exactly
             donor = _rpa_shell_donor(sigma_old.fit_smom(n_freq=1)[1], sigma_dmft.niv)
-        shell_offset = sigma_old.shell_offset_from(donor) if comm.rank == 0 else None
+        shell_offset, shell_moment = _shell_terms(sigma_old, donor) if comm.rank == 0 else (None, None)
         sigma_old = sigma_old.cut_niv(config.box.niv_core) if comm.rank == 0 else None
         if saving is not None:
             saving.result()
@@ -3907,7 +4061,7 @@ def calculate_self_energy_q(
         # ranks once per node through a shared window instead of once per rank
         damped_step = False
         if comm.rank == 0:
-            sigma_old = sigma_old.concatenate_self_energies(donor, shell_offset=shell_offset)
+            sigma_old = sigma_old.concatenate_self_energies(donor, shell_offset=shell_offset, shell_moment=shell_moment)
             if config.stabilization.use_jacobian_stabilization:
                 # the record of the pairs the tracker reads: the core window, the rest is the shell tail and its offset
                 _save_sigma_iteration(sigma_new.cut_niv(config.box.niv_core), "sigma_dga_proposal", current_iter)
@@ -3927,7 +4081,11 @@ def calculate_self_energy_q(
         )
 
         # every rank solves mu on its momenta of the shared sigma; the moments are fitted on rank 0 alone, in RPA mode
-        # from the outermost frequency, where its shell holds them exactly however short the shell is
+        # from the outermost frequency, where its shell holds them exactly however short the shell is. The filling
+        # sums the loop's box, shell included, against a model carrying Sigma_inf alone, so the k-dependent 1/iv
+        # shell term of v_tail_shell enters through the box; it is anti-Hermitian, so it leaves the fitted smom0
+        # unchanged, and beyond the box a 1/iv term of Sigma adds nothing to the real part of the frequency sum
+        # (its +-nu terms cancel), so the k-independent model is kept
         old_mu = mu_history[-1]
         n_freq = 1 if config.misc.do_rpa else None
         smom0, smom1 = comm.bcast(sigma_new.fit_smom(n_freq) if comm.rank == 0 else None, root=0)
@@ -3951,17 +4109,17 @@ def calculate_self_energy_q(
 
         # new occupation matrix and energies from the new Green's function (outside the asympt region its shell is the
         # donor's: DMFT, or RPA mode's own tail); k-distributed, so no rank builds the whole DMFT-box Green's function
-        force_k = [] if tail_diagnostic else None
+        # the force correlation of the new iterate, for the 1/iv coefficient of the next proposal (every rank)
+        holder = [] if tail_diagnostic else None
         n_current, config.sys.occ, config.sys.occ_k, ekin, epot = _update_occ_and_energies_distributed(
             sigma_new,
             donor,
             mpi_dist_fullbz,
             config.sys.mu,
             mpi_dist_irrk if wedge is not None else None,
-            force_k,
+            holder,
         )
-        if tail_diagnostic and comm.rank == 0:
-            _log_tail_moment(u_loc, v_nonloc_full, force_k[0], sigma_dmft_full)
+        force_k = None if holder is None else holder[0]
         logger.info(f"Filling of the updated Green's function: {n_current:.6f} (target {config.sys.n:.6f}).")
         logger.info(f"Kinetic energy: {ekin:.4f} [t or eV].")
         logger.info(f"Potential energy: {epot:.4f} [t or eV].")

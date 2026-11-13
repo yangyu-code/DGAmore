@@ -124,6 +124,9 @@ class SelfConsistencyConfig:
     :ivar bool save_sigma_iterates: Whether to keep every per-iteration self-energy on disk. If False, the loop deletes
         the iterates older than the last ``mixing_history_length + 1`` iterations as it goes and, after the loop, all
         but the last iteration's.
+    :ivar bool v_tail_shell: Whether the shell beyond the core box carries the analytic, momentum-dependent
+        :math:`1/\imath\nu` coefficient of the self-energy for a non-local :math:`V^{\mathbf{q}}` instead of the
+        DMFT one (ignored for :math:`V^{\mathbf{q}} = 0` and in RPA mode).
     :ivar str sigma_iterates_subfolder_name: Subfolder name (under the output path) for the per-iteration
         self-energies the loop writes; the resolved directory is :attr:`OutputConfig.sigma_iterates_path`.
     """
@@ -137,6 +140,7 @@ class SelfConsistencyConfig:
         self.previous_sc_path: str = ""
         self.use_interpolated_sigma: bool = False
         self.save_sigma_iterates: bool = True
+        self.v_tail_shell: bool = False
         self.sigma_iterates_subfolder_name: str = "Sigma_Iterates"
 
 

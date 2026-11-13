@@ -613,6 +613,27 @@ def test_fit_smom_concatenated_with_shell_offset_is_bit_identical_to_the_offset_
     assert np.array_equal(mom0, ref0) and np.array_equal(mom1, ref1)
 
 
+def test_shell_moment_is_added_outside_the_core_and_read_back_with_the_offset():
+    """A Hermitian [q, o1, o2] shell moment M adds M / iv to the donor's shell frequencies only, the moment fit of the
+    concatenation is the one of its fit window, and shell_terms_from splits the Hermitian offset and M back from the
+    outermost frequency."""
+    core, shell, _ = _offset_setup(12)
+    rng = np.random.default_rng(13)
+    offset, moment = rng.standard_normal((2, 6, 2, 2)) + 1j * rng.standard_normal((2, 6, 2, 2))
+    offset, moment = offset + np.conj(offset.swapaxes(-1, -2)), moment + np.conj(moment.swapaxes(-1, -2))
+    plain = core.copy().concatenate_self_energies(shell, shell_offset=offset)
+    result = core.copy().concatenate_self_energies(shell, shell_offset=offset, shell_moment=moment)
+
+    expected = moment[..., None] / (1j * MFHelper.vn(shell.niv, sys.beta))
+    niv_diff = shell.niv - core.niv
+    expected[..., niv_diff : niv_diff + 2 * core.niv] = 0.0
+    assert np.allclose(result.mat - plain.mat, expected, atol=1e-6)
+    mom0, mom1 = core.fit_smom_concatenated(shell, shell_offset=offset, shell_moment=moment)
+    assert np.allclose(mom0, result.smom[0], atol=1e-6) and np.allclose(mom1, result.smom[1], atol=1e-6)
+    read_offset, read_moment = result.shell_terms_from(shell)
+    assert np.allclose(read_offset, offset, atol=1e-5) and np.allclose(read_moment, moment, atol=1e-4)
+
+
 @pytest.mark.parametrize("compressed", [True, False])
 def test_shell_offset_from_recovers_the_constant_carried_in_the_shell(compressed):
     """shell_offset_from reads the [q, o1, o2] constant of the outermost frequency back from either momentum layout."""

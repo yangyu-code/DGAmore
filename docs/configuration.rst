@@ -130,6 +130,7 @@ This section controls the self-consistency cycle.
      previous_sc_path: ""          # str
      use_interpolated_sigma: False # bool
      save_sigma_iterates: True     # bool
+     v_tail_shell: False           # bool
 
 The ``max_iter`` field puts an upper limit on the number of iterations; if the self-energy has not converged by
 then, the loop stops and the program exits. The non-local self-energy is written to the output folder for every
@@ -167,6 +168,21 @@ interpolated self-energy of the previous run, with the interpolation itself conf
 :ref:`self-energy interpolation section <self-energy-interpolation>`. Setting ``save_sigma_iterates`` to ``False``
 saves disk space: during the loop only the files of the last ``mixing_history_length + 1`` iterations stay in
 ``Sigma_Iterates``, and after the loop only those of the last iteration, which is all a resumed run reads.
+
+Outside the core box the loop's self-energy is the DMFT self-energy plus the momentum-dependent :math:`V^{\mathbf{q}}`
+Hartree-Fock term of the current occupations, so its :math:`1/\imath\nu` coefficient is the momentum-independent DMFT
+one, while for :math:`V^{\mathbf{q}} \neq 0` the exact coefficient :math:`\Sigma_1(\mathbf{k})` of
+:math:`\Sigma(\mathbf{k}, \imath\nu) \to \Sigma_{\mathrm{HF}}(\mathbf{k}) + \Sigma_1(\mathbf{k})/\imath\nu` depends on
+the momentum. Each proposal computes :math:`\Sigma_1(\mathbf{k})` from the occupations and the force correlation
+:math:`\frac{1}{\beta}\sum_\nu \Sigma G` of its input self-energy and from the box frequency sum of its own density
+susceptibility (see :func:`~dgamore.nonlocal_sde.get_self_energy_tail_moment`) and logs it next to the DMFT coefficient.
+With ``v_tail_shell`` set to ``True`` the shell also carries it: the proposal's shell becomes
+:math:`\Sigma_{\mathrm{DMFT}}(\imath\nu) + \Sigma^{V}_{\mathrm{HF}}(\mathbf{k}) + [\Sigma_1(\mathbf{k}) -
+\Sigma_1^{\mathrm{DMFT}}]/\imath\nu`, and the occupation, the energies and the saved self-energy read it. The option is
+ignored for :math:`V^{\mathbf{q}} = 0` and in RPA mode, and needs an interaction whose bilinears are orbital diagonal.
+Without a lambda correction the box sum of the ladder density susceptibility misses part of its sum rule, so the
+coefficient inherits that error; the log reports the momentum average of the density correlation for comparison with
+the local :math:`\langle n^2\rangle`.
 
 .. _stabilization:
 

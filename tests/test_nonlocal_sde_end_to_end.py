@@ -114,9 +114,11 @@ def _srvo3_self_energy(comm_mock, folder: str) -> np.ndarray:
     return sigma.decompress_q_dimension().mat
 
 
-def test_calculates_nonlocal_sde_correctly(setup):
-    """The non-local SDE reproduces the reference self-energy."""
+@pytest.mark.parametrize("v_tail_shell", [False, True])
+def test_calculates_nonlocal_sde_correctly(setup, v_tail_shell):
+    """The non-local SDE reproduces the reference self-energy; its V^q = 0 drops v_tail_shell, leaving it unchanged."""
     folder, comm_mock = setup
+    config.self_consistency.v_tail_shell = v_tail_shell
 
     config.box.niw_core = 20
     config.box.niv_core = 20
@@ -138,6 +140,7 @@ def test_calculates_nonlocal_sde_correctly(setup):
     sigma_dga_mat = sigma_dga.decompress_q_dimension().cut_niv(50).mat
     sigma_dga_ref = np.load(f"{folder}/sigma_dga.npy")
 
+    assert not np.any(v_nonloc.mat) and not config.self_consistency.v_tail_shell
     assert np.allclose(sigma_dga_mat, sigma_dga_ref, atol=3e-5)
 
 

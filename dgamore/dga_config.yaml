@@ -25,6 +25,8 @@ self_consistency:
   # the code will start from the last iteration of the previous calculation and does max_iter steps on top
   use_interpolated_sigma: False # If True, the code will use the interpolated self-energy from the previous iteration
   save_sigma_iterates: True # If False, only the last mixing_history_length + 1 iterates are kept during the loop and only the last one after it. Default: True
+  v_tail_shell: False # If True and V^q != 0 (not in RPA mode), the shell beyond the core box carries the analytic k-dependent 1/iv coefficient Sigma_1(k) of the
+  # self-energy, from the iterate's occupations, force correlation and density susceptibility, instead of the DMFT one. Default: False
 
 stabilization:
   use_lambda_correction: False # If True, applies the Moriya lambda correction in every iteration as a releasing scaffold (correction on until convergence at 10x epsilon,

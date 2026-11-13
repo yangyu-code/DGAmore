@@ -226,6 +226,7 @@ class ConfigParser:
         conf.previous_sc_path = self._try_parse(section, "previous_sc_path", conf.previous_sc_path)
         conf.use_interpolated_sigma = self._try_parse(section, "use_interpolated_sigma", conf.use_interpolated_sigma)
         conf.save_sigma_iterates = self._try_parse(section, "save_sigma_iterates", conf.save_sigma_iterates)
+        conf.v_tail_shell = self._try_parse(section, "v_tail_shell", conf.v_tail_shell)
 
         return conf
 

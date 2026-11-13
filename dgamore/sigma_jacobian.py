@@ -19,8 +19,9 @@ eigenpairs next to a few given directions with a short block Arnoldi, the exact 
 the loop.
 
 The Jacobian is evaluated at the pure map: no lambda correction, susceptibility restriction or annealing mass, and the
-momentum-dependent :math:`V^{\mathbf{q}}` Hartree-Fock offset of the shell held at its value (exact for :math:`V = 0`),
-on the self-energies the loop can reach (:func:`sector_projector`).
+momentum-dependent :math:`V^{\mathbf{q}}` Hartree-Fock offset of the shell, and with
+``config.self_consistency.v_tail_shell`` its :math:`1/\imath\nu` coefficient, held at their values (exact for
+:math:`V = 0`), on the self-energies the loop can reach (:func:`sector_projector`).
 """
 
 import contextlib

@@ -269,13 +269,15 @@ class SelfEnergy(TwoPoint):
         shell_offset: np.ndarray | None = None,
         out: np.ndarray | None = None,
         frequencies: slice | None = None,
+        shell_moment: np.ndarray | None = None,
     ) -> "SelfEnergy":
-        """
+        r"""
         Builds a self-energy that keeps ``self`` inside its core box and uses ``other`` for the shell, up to
         ``other.niv``. An optional momentum-dependent constant is added to the shell frequencies only, e.g. the
-        momentum-dependent part of the Hartree-Fock term that a momentum-local shell donor does not carry. Every
-        frequency of the result is built on its own, so slabs of frequencies written one by one into ``out`` hold the
-        bits of the whole concatenation.
+        momentum-dependent part of the Hartree-Fock term that a momentum-local shell donor does not carry, and an
+        optional momentum-dependent :math:`1/\imath\nu` term, e.g. the deviation of the analytic tail coefficient from
+        the donor's. Every frequency of the result is built on its own, so slabs of frequencies written one by one into
+        ``out`` hold the bits of the whole concatenation.
 
         :param other: The self-energy supplying the shell frequencies; must have at least as many frequencies as ``self``.
         :param shell_offset: Constant added to every shell frequency, shape ``[q, o1, o2]`` in the compressed momentum
@@ -284,6 +286,8 @@ class SelfEnergy(TwoPoint):
             shared-memory window), or ``None`` to allocate it.
         :param frequencies: The contiguous range of the result's frequency indices to build, or ``None`` for all;
             the other frequencies of ``out`` are left as they are.
+        :param shell_moment: Coefficient :math:`M` of the term :math:`M/\imath\nu` added to every shell frequency,
+            shaped like ``shell_offset``; ``None`` adds nothing.
         :return: A :class:`SelfEnergy` spanning ``other``'s frequency box, viewing ``out`` when given; its moments are
             fitted only when every frequency is built.
         :raises ValueError: If ``other`` has fewer frequencies than ``self``.
@@ -309,6 +313,9 @@ class SelfEnergy(TwoPoint):
             result_mat[..., first:last] = other.mat[..., first:last]
             if shell_offset is not None:
                 result_mat[..., first:last] += np.asarray(shell_offset)[..., None]
+            if shell_moment is not None:
+                iv = 1j * MFHelper.vn(other.niv, self._beta)[first:last]
+                result_mat[..., first:last] += np.asarray(shell_moment)[..., None] / iv
         return SelfEnergy(
             result_mat,
             self.nq,
@@ -385,17 +392,19 @@ class SelfEnergy(TwoPoint):
             block[...] = symmetry_reduction.project_onto_point_group(weighted, maps, us, rows=k_grid.irrk_ind)
 
     def fit_smom_concatenated(
-        self, other: "SelfEnergy", shell_offset: np.ndarray | None = None
+        self, other: "SelfEnergy", shell_offset: np.ndarray | None = None, shell_moment: np.ndarray | None = None
     ) -> tuple[np.ndarray, np.ndarray]:
-        """
+        r"""
         Fits the high-frequency moments that :meth:`fit_smom` would report for
-        ``self.concatenate_self_energies(other, shell_offset)``, without building the momentum-resolved
-        concatenation: only the fit window (the top fifth of ``other``'s positive frequencies) is assembled from the
-        same column sources, so the moments are bit-identical to the full concatenation's fit.
+        ``self.concatenate_self_energies(other, shell_offset, shell_moment=shell_moment)``, without building the
+        momentum-resolved concatenation: only the fit window (the top fifth of ``other``'s positive frequencies) is
+        assembled from the same column sources, so the moments are bit-identical to the full concatenation's fit.
 
         :param other: The self-energy supplying the shell frequencies; must have at least as many frequencies as ``self``.
         :param shell_offset: Constant added to every shell frequency, shape ``[q, o1, o2]`` in the compressed momentum
             layout (or broadcastable to it); ``None`` adds nothing.
+        :param shell_moment: Coefficient of the :math:`1/\imath\nu` term added to every shell frequency, shaped like
+            ``shell_offset``; ``None`` adds nothing.
         :return: The tuple ``(mom0, mom1)`` of moments, each of shape ``[o1, o2]``.
         :raises ValueError: If ``other`` has fewer frequencies than ``self``.
         """
@@ -418,9 +427,11 @@ class SelfEnergy(TwoPoint):
         mat_fit[..., split - lo :] = other.mat[..., split:]
         if shell_offset is not None:
             mat_fit[..., split - lo :] += np.asarray(shell_offset)[..., None]
+        iv = 1j * MFHelper.vn(niv_res, self._beta, return_only_positive=True)
+        if shell_moment is not None:
+            mat_fit[..., split - lo :] += np.asarray(shell_moment)[..., None] / iv[split - niv_res :]
 
         fitdata = np.mean(mat_fit.reshape(*self.nq, self.n_bands, self.n_bands, n_freq_fit), axis=(0, 1, 2))
-        iv = 1j * MFHelper.vn(niv_res, self._beta, return_only_positive=True)
         iwfit = iv[niv_res - n_freq_fit :][None, None, :]
 
         return self._hermitian_moments(fitdata, iwfit)
@@ -444,6 +455,24 @@ class SelfEnergy(TwoPoint):
         last = self.mat.reshape(-1, nb, nb, self.mat.shape[-1])[..., -1]
         donor = other.mat.reshape(-1, nb, nb, other.mat.shape[-1])[..., other.niv + self.niv - 1]
         return last - donor
+
+    def shell_terms_from(self, other: "SelfEnergy") -> tuple[np.ndarray, np.ndarray]:
+        r"""
+        Splits the shell offset of :meth:`shell_offset_from` into the momentum-dependent constant :math:`H` and the
+        coefficient :math:`M` of the term :math:`M/\imath\nu` that ``self`` carries on top of ``other`` (the
+        ``shell_offset`` and ``shell_moment`` of :meth:`concatenate_self_energies`), read from the outermost positive
+        frequency: for Hermitian :math:`H` and :math:`M` the offset :math:`H + M/\imath\nu` has :math:`H` as its
+        Hermitian and :math:`M/\imath\nu` as its anti-Hermitian part. Like the offset, this is exact for any linear
+        mixture of self-energies padded that way.
+
+        :param other: The self-energy supplying the shell frequencies; must have at least as many frequencies as
+            ``self``.
+        :return: The tuple ``(offset, moment)``, each of shape ``[q, o1, o2]`` in the compressed momentum layout.
+        :raises ValueError: If ``other`` has fewer frequencies than ``self``.
+        """
+        offset = self.shell_offset_from(other)
+        hermitian = 0.5 * (offset + np.conj(np.swapaxes(offset, -1, -2)))
+        return hermitian, 1j * MFHelper.vn(self.niv, self._beta)[-1] * (offset - hermitian)
 
     def fit_polynomial(self, n_fit: int = 4, degree: int = 3, niv_core: int = 0) -> "SelfEnergy":
         """
