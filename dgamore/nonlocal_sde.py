@@ -120,6 +120,79 @@ def get_hartree_fock(
     return hartree[None, ..., None], fock[..., None]  # [k,o1,o2,v]
 
 
+def get_self_energy_tail_moment(
+    u_loc: LocalInteraction,
+    v_nonloc: Interaction,
+    occ: np.ndarray,
+    occ_k: np.ndarray,
+    nn_q: np.ndarray,
+    force_k: np.ndarray,
+) -> np.ndarray:
+    r"""
+    Returns the coefficient :math:`\Sigma_1(\mathbf{k})` of :math:`\Sigma(\mathbf{k}, \imath\nu) \to
+    \Sigma_{\mathrm{HF}}(\mathbf{k}) + \Sigma_1(\mathbf{k}) / \imath\nu` for a spin-independent density-density
+    interaction :math:`W^{\mathbf{q}} = U + V^{\mathbf{q}}` whose bilinears are orbital diagonal (only
+    :math:`W^{\mathbf{q}}_{aabb} \neq 0`), in the form with the same-orbital double occupancy eliminated,
+
+    .. math:: \Sigma_{1;ab}(\mathbf{k}) = \delta_{ab} \Big[\tfrac{1}{N} \sum_{\mathbf{q}c e}
+        (W^{\mathbf{q}}_{aacc} - \delta_{ac} U_{aaaa}) W^{\mathbf{q}}_{aaee} C^{\mathbf{q}}_{ce}
+        + 2 U_{aaaa}^2 n_{aa}\Big] - \tfrac{1}{N} \sum_{\mathbf{p}} \big[
+        (W - U_{\mathrm{diag}})^{\mathbf{k}-\mathbf{p}}_{aabb} (F^{\mathbf{p}}_{ab} + F^{\mathbf{p}*}_{ba})
+        + (W^2)^{\mathbf{k}-\mathbf{p}}_{aabb} n^{\mathbf{p}}_{ab}\big]
+        - [\Sigma_{\mathrm{HF}}(\mathbf{k})^2]_{ab},
+
+    with :math:`U_{aaaa} = N^{-1} \sum_{\mathbf{q}} W^{\mathbf{q}}_{aaaa}`, :math:`W - U_{\mathrm{diag}}` the
+    interaction without its on-site :math:`aaaa` elements, and :math:`W^2` the element-wise square in real space. The
+    two momentum sums are the Fock convolution of :func:`get_hartree_fock` with other occupations and interactions.
+    The form follows from :math:`\Sigma_1 = \langle\{[c, H_{\mathrm{int}}], [c, H_{\mathrm{int}}]^\dagger\}\rangle -
+    \Sigma_{\mathrm{HF}}^2`; the exact local identity between the two correlation inputs removes the same-orbital double
+    occupancy, which a ladder approximation of the two inputs need not give consistently, so the on-site limit
+    :math:`V = 0` of a single band is :math:`U^2 n(1-n)` for any inputs.
+
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` on the full q-grid.
+    :param occ: The k-averaged occupation per spin ``[o1, o2]``, :math:`n_{ab} = \langle c^\dagger_b c_a\rangle`.
+    :param occ_k: The k-resolved occupation per spin ``[kx, ky, kz, o1, o2]``.
+    :param nn_q: The density correlation :math:`C^{\mathbf{q}}_{ce} = N^{-1}\langle n_c(-\mathbf{q})
+        n_e(\mathbf{q})\rangle` of the spin-summed orbital densities ``[qx, qy, qz, o1, o2]``, i.e.
+        :math:`\tfrac{2}{\beta}\sum_\omega \chi^{\omega\mathbf{q}}_{d;ccee}` plus :math:`N\delta_{\mathbf{q}0}
+        \langle n_c\rangle\langle n_e\rangle`.
+    :param force_k: The force correlation :math:`F^{\mathbf{k}}_{ab} = \tfrac{1}{\beta}\sum_\nu e^{\imath\nu 0^+}
+        [\Sigma(\mathbf{k}, \imath\nu) G(\mathbf{k}, \imath\nu)]_{ab}` ``[kx, ky, kz, o1, o2]``.
+    :return: :math:`\Sigma_1(\mathbf{k})` as ``[k, o1, o2]``.
+    :raises NotImplementedError: For an orbital off-diagonal bilinear, whose coefficient needs a three-point
+        correlation, or for :math:`W^{-\mathbf{q}} \neq W^{\mathbf{q}}`, whose momentum orientation is not validated.
+    """
+    nb, nk = config.sys.n_bands, config.lattice.nk
+    nk_tot = int(np.prod(nk))
+    w_q = (u_loc + v_nonloc).decompress_q_dimension().mat.astype(np.complex128)  # [kx, ky, kz, a, b, c, d]
+    is_diag = np.einsum("ab,cd->abcd", np.eye(nb), np.eye(nb)).astype(bool)
+    if np.any(np.abs(w_q[..., ~is_diag]) > 1e-12):
+        raise NotImplementedError("The tail moment needs orbital-diagonal interaction bilinears W_aabb.")
+    if not np.allclose(np.roll(np.flip(w_q, axis=(0, 1, 2)), 1, axis=(0, 1, 2)), w_q):
+        raise NotImplementedError("The tail moment needs an inversion-symmetric interaction W^{-q} = W^q.")
+
+    diag = np.arange(nb)
+    w_ab = np.einsum("xyzaabb->xyzab", w_q).reshape(nk_tot, nb, nb)
+    u_aa = w_ab.mean(axis=0)[diag, diag]
+    w_ab_sub = w_ab.copy()
+    w_ab_sub[:, diag, diag] -= u_aa
+    density_term = np.einsum("qac,qad,qcd->a", w_ab_sub, w_ab, nn_q.reshape(nk_tot, nb, nb)) / nk_tot
+
+    w_r = sp.fft.fftn(w_q, axes=(0, 1, 2))  # N W(r), the representation get_hartree_fock convolves with
+    w_r_sub = w_r.copy()
+    w_r_sub[0, 0, 0, diag, diag, diag, diag] = 0.0
+    hartree, fock = get_hartree_fock(u_loc, v_nonloc, occ, occ_k, w_r_mat=w_r)
+    force_sym = force_k + np.conj(np.swapaxes(force_k, -1, -2))
+    force_term = get_hartree_fock(u_loc, v_nonloc, occ, force_sym, w_r_mat=w_r_sub)[1]
+    occupation_term = get_hartree_fock(u_loc, v_nonloc, occ, occ_k, w_r_mat=w_r**2 / nk_tot)[1]
+
+    sigma_hf = (hartree + fock)[..., 0]
+    sigma_1 = (force_term + occupation_term)[..., 0] - sigma_hf @ sigma_hf
+    sigma_1[:, diag, diag] += density_term + 2.0 * u_aa**2 * occ[diag, diag]
+    return sigma_1
+
+
 def create_inverse_auxiliary_chi_r_q(
     gamma_r: LocalFourPoint, gchi0_q_inv: FourPoint, u_r: LocalInteraction
 ) -> FourPoint:
@@ -2408,6 +2481,47 @@ def _share_sigma_per_node(
     return sigma, win
 
 
+def _log_tail_moment(
+    u_loc: LocalInteraction, v_nonloc: Interaction, force_k: np.ndarray, sigma_dmft: SelfEnergy
+) -> None:
+    r"""
+    Logs the analytic tail coefficient :math:`\Sigma_1(\mathbf{k})` of :func:`get_self_energy_tail_moment` next to the
+    k-independent one the DMFT shell carries. The density correlation is the box frequency sum of this iteration's
+    lambda-corrected density susceptibility, the sum its sum rule fixes; no tail is extrapolated, since the corrected
+    susceptibility need not decay as :math:`\omega^{-2}` inside the box. Diagnostic only; skipped without the
+    susceptibility file or for an unsupported interaction.
+
+    :param u_loc: The bare local interaction :math:`U`.
+    :param v_nonloc: The non-local interaction :math:`V^{\mathbf{q}}` on the full q-grid.
+    :param force_k: The k-resolved force correlation ``[kx, ky, kz, o1, o2]``.
+    :param sigma_dmft: The DMFT :class:`SelfEnergy` supplying the shell.
+    :return: None.
+    """
+    path = os.path.join(config.output.output_path, "chi_phys_q_dens.npy")
+    if not os.path.exists(path):
+        return
+    nk, nb, beta = config.lattice.nk, config.sys.n_bands, config.sys.beta
+    chi = FourPoint.load(path, SpinChannel.DENS, num_vn_dimensions=0, has_compressed_q_dimension=True, nq=nk)
+    chi = chi.to_full_niw_range().map_to_full_bz(config.lattice.k_grid).to_compound_indices().mat  # [q, w, ab, cd]
+    dens = np.arange(nb) * (nb + 1)  # compound index of the density aa
+    nn_q = 2.0 / beta * chi[..., dens[:, None], dens[None, :]].sum(axis=1)  # chi_{ccdd} summed over w, [q, c, d]
+    n_orb = 2.0 * np.real(np.diagonal(config.sys.occ))
+    nn_q[0] += np.prod(nk) * np.outer(n_orb, n_orb)
+    try:
+        sigma_1 = get_self_energy_tail_moment(
+            u_loc, v_nonloc, config.sys.occ, config.sys.occ_k, nn_q.reshape(*nk, nb, nb), force_k
+        )
+    except NotImplementedError as error:
+        config.logger.info(f"Tail moment diagnostic skipped: {error}")
+        return
+    shell = -sigma_dmft.smom[1]  # the SelfEnergy moments are Sigma_inf - smom1 / i nu
+    diagonal = np.real(np.diagonal(sigma_1, axis1=-2, axis2=-1))
+    config.logger.info(
+        f"Tail moment Sigma_1(k): diagonal in [{diagonal.min():.4f}, {diagonal.max():.4f}], DMFT shell "
+        f"{np.real(np.diagonal(shell)).round(4)}, largest deviation {np.abs(sigma_1 - shell).max():.4e}."
+    )
+
+
 def _occupation_self_energy(
     sigma_new: SelfEnergy,
     sigma_dmft_full: SelfEnergy,
@@ -2446,7 +2560,11 @@ def _occupation_self_energy(
 
 
 def _slice_occupation_and_energies(
-    sigma_occ: SelfEnergy, mu: float, rows: slice | np.ndarray, weights: np.ndarray | None = None
+    sigma_occ: SelfEnergy,
+    mu: float,
+    rows: slice | np.ndarray,
+    weights: np.ndarray | None = None,
+    force_k: list | None = None,
 ) -> tuple[np.ndarray, float, float]:
     r"""
     Returns the k-resolved occupation and the kinetic and potential energies of this rank's momentum slice, which
@@ -2458,6 +2576,8 @@ def _slice_occupation_and_energies(
     :param rows: The flat grid indices of this rank's momenta.
     :param weights: A weight per momentum of the slice in its energy sums (the size of the star of an irreducible
         momentum), or ``None`` for the plain sums.
+    :param force_k: Holder that receives the slice's force correlation (see :meth:`GreensFunction.get_force_k`), or
+        ``None`` to skip it.
     :return: The tuple ``(occ_k_slice, ekin, epot)`` of this rank's k-resolved occupation ``[k, 1, 1, o1, o2]`` on
         every orbital of H(k) and its kinetic and potential energy sums divided by its number of momenta.
     """
@@ -2469,6 +2589,8 @@ def _slice_occupation_and_energies(
     )
     _, _, occ_k_slice = giwk_occ.get_fill_nonlocal(real_dispersion=np.isrealobj(np.real_if_close(ek)))
     ekin, epot = giwk_occ.get_ekin(weights), giwk_occ.get_epot(weights=weights)
+    if force_k is not None:
+        force_k.append(giwk_occ.get_force_k())
     giwk_occ.free()
     return occ_k_slice, ekin, epot
 
@@ -2479,6 +2601,7 @@ def _update_occ_and_energies_distributed(
     mpi_dist_fullbz: MpiDistributor,
     mu: float,
     mpi_dist_irrk: MpiDistributor | None = None,
+    force_k: list | None = None,
 ) -> tuple[float, np.ndarray, np.ndarray, float, float]:
     r"""
     Computes the occupation and the kinetic and potential energies of the mixed self-energy on the DMFT frequency
@@ -2503,6 +2626,8 @@ def _update_occ_and_energies_distributed(
     :param mpi_dist_fullbz: MPI distributor over the full BZ q-points.
     :param mu: Chemical potential :math:`\mu`.
     :param mpi_dist_irrk: MPI distributor over the irreducible momenta, or ``None`` to evaluate every momentum.
+    :param force_k: Holder that receives the k-resolved force correlation ``[kx, ky, kz, o1, o2]`` of the correlated
+        orbitals on every rank, assembled like the occupation, or ``None`` to skip it.
     :return: The tuple ``(n, occ, occ_k, ekin, epot)``: total filling over every orbital, k-averaged ``[o1, o2]``
         and k-resolved ``[kx, ky, kz, o1, o2]`` occupation of the correlated orbitals, and the kinetic and potential
         energies per site.
@@ -2519,12 +2644,17 @@ def _update_occ_and_energies_distributed(
 
     # a rank without momenta (more ranks than momenta) adds nothing to the reductions below
     occ_k_slice, ekin, epot = np.zeros((0, 1, 1, n_orbitals, n_orbitals)), 0.0, 0.0
+    force_slices = [] if force_k is not None else None
     if n_my:
-        occ_k_slice, ekin, epot = _slice_occupation_and_energies(sigma_occ, mu, rows, weights)
+        occ_k_slice, ekin, epot = _slice_occupation_and_energies(sigma_occ, mu, rows, weights, force_slices)
     sigma_occ.free()
 
     unfold = mpi_dist_irrk is not None
     n_el, occ, occ_k = _assemble_occupation(occ_k_slice, dist, config.sys.correlated_orbitals, unfold)
+    if force_k is not None:
+        nb = config.sys.n_bands
+        force_slice = force_slices[0] if force_slices else np.zeros((0, 1, 1, nb, nb))
+        force_k[:] = [_assemble_occupation(force_slice, dist, None, unfold)[2]]
     scalars = np.array([ekin, epot]) * n_my
     if dist.mpi_size > 1:
         scalars = dist.comm.allreduce(scalars)
@@ -3660,6 +3790,11 @@ def calculate_self_energy_q(
             f"from every iterate's occupations, while the tracker records the core window alone{held}, so the "
             "measured spectrum and the one in jacobian.npz leave out its feedback."
         )
+    # the V^q tail-moment diagnostic reads the lambda-corrected density susceptibility file of each iteration
+    lambda_on = config.lambda_correction.perform_lambda_correction or config.stabilization.use_lambda_correction
+    tail_diagnostic = comm.bcast(
+        comm.rank == 0 and lambda_on and not config.misc.do_rpa and bool(np.any(v_nonloc.mat)), root=0
+    )
     v_nonloc = scatter_irreducible_interaction(v_nonloc, mpi_dist_irrk)
     # the operator arguments of both exact-Jacobian helpers after the iterate and its mu
     exact_args = (u_loc, v_nonloc, v_nonloc_full, sigma_dmft_full, mpi_dist_irrk, mpi_dist_fullbz, comm, chunk_budgets)
@@ -3816,9 +3951,17 @@ def calculate_self_energy_q(
 
         # new occupation matrix and energies from the new Green's function (outside the asympt region its shell is the
         # donor's: DMFT, or RPA mode's own tail); k-distributed, so no rank builds the whole DMFT-box Green's function
+        force_k = [] if tail_diagnostic else None
         n_current, config.sys.occ, config.sys.occ_k, ekin, epot = _update_occ_and_energies_distributed(
-            sigma_new, donor, mpi_dist_fullbz, config.sys.mu, mpi_dist_irrk if wedge is not None else None
+            sigma_new,
+            donor,
+            mpi_dist_fullbz,
+            config.sys.mu,
+            mpi_dist_irrk if wedge is not None else None,
+            force_k,
         )
+        if tail_diagnostic and comm.rank == 0:
+            _log_tail_moment(u_loc, v_nonloc_full, force_k[0], sigma_dmft_full)
         logger.info(f"Filling of the updated Green's function: {n_current:.6f} (target {config.sys.n:.6f}).")
         logger.info(f"Kinetic energy: {ekin:.4f} [t or eV].")
         logger.info(f"Potential energy: {epot:.4f} [t or eV].")

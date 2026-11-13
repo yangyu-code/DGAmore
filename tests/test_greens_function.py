@@ -315,6 +315,24 @@ def test_get_epot_e_corr_einsum_matches_transposed_product_reference():
     assert np.isfinite(g.get_epot())
 
 
+def test_get_force_k_of_the_hubbard_atom_is_u_times_the_double_occupancy():
+    """For the exact atomic self-energy the force correlation (1/beta) sum_v Sigma G is U <n_up n_dn>."""
+    beta, mu, u, niv = 4.0, 1.3, 3.0, 400
+    weights = np.exp(beta * np.array([0.0, mu, mu, 2 * mu - u]))  # empty, up, down, doubly occupied
+    n_spin, docc = (weights[1] + weights[3]) / weights.sum(), weights[3] / weights.sum()
+    iv = 1j * MFHelper.vn(niv, beta)
+    sigma_mat = u * n_spin + u**2 * n_spin * (1 - n_spin) / (iv + mu - u * (1 - n_spin))
+    sig = SelfEnergy(sigma_mat.reshape(1, 1, 1, -1), nk=(1, 1, 1), has_compressed_q_dimension=True, beta=beta)
+    g = GreensFunction.get_g_full(sig, mu, np.zeros((1, 1, 1, 1, 1)), beta)
+    g.get_fill_nonlocal()
+
+    force_k = g.get_force_k()
+
+    assert force_k.shape == (1, 1, 1, 1, 1)
+    assert np.isclose(force_k.real.item(), u * docc, atol=1e-5)
+    assert abs(force_k.imag.item()) < 1e-6
+
+
 @pytest.mark.parametrize("complex_hopping", [False, True])
 def test_non_interacting_mu_holds_the_filling_in_the_fermi_sum_of_the_bands(complex_hopping):
     """The non-interacting mu puts the Fermi sum 2 mean_k sum_b f(eps_b(k) - mu) of the band energies on the filling."""

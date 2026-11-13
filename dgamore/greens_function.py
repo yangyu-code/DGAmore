@@ -792,6 +792,29 @@ class GreensFunction(TwoPoint):
 
         return (e_hartree + e_corr + e_tail) / self.nq_tot
 
+    def get_force_k(self) -> np.ndarray:
+        r"""
+        Computes the k-resolved force correlation :math:`F^{\mathbf{k}} = \frac{1}{\beta} \sum_\nu e^{\imath\nu 0^+}
+        \Sigma(\mathbf{k}, \imath\nu) G(\mathbf{k}, \imath\nu)` as an orbital matrix, the input of
+        :func:`~dgamore.nonlocal_sde.get_self_energy_tail_moment`. Unlike :meth:`get_epot`, the constant
+        :math:`\Sigma_\infty(\mathbf{k})` and the tail coefficient are taken per momentum, from the Hermitian and
+        anti-Hermitian parts at the outermost frequency, because a k-averaged constant leaves a momentum-dependent
+        error of half its deviation. The constant enters with the occupation, the remainder is summed in the box, and
+        its :math:`1/\nu^2` tail beyond the box is added analytically with :math:`\frac{1}{\beta}\sum_\nu \nu^{-2} =
+        \beta/4`. Requires the occupation of :meth:`get_fill_nonlocal`.
+
+        :return: :math:`F^{\mathbf{k}}` of shape ``[kx, ky, kz, o1, o2]`` on the correlated orbitals.
+        """
+        sigma = self._sigma.decompress_q_dimension().mat
+        g = self.decompress_q_dimension().mat
+        edge = sigma[..., -1]
+        sigma_inf = 0.5 * (edge + np.conj(np.swapaxes(edge, -1, -2)))
+        vn = MFHelper.vn(self.niv, self._beta)
+        moment = 1j * vn[-1] * (edge - sigma_inf)  # Sigma - Sigma_inf -> moment / i nu
+        in_box = np.einsum("...abv,...bcv->...ac", sigma - sigma_inf[..., None], g) / self._beta
+        tail = self._beta / 4 - np.sum(1.0 / vn**2) / self._beta
+        return sigma_inf @ orbital_block(self._occ_k, self._orbitals) + in_box - moment * tail
+
     def _model_epot(self, smom0, smom1, niv, beta, weights=None):
         r"""
         Evaluates the analytic :math:`1/\nu^2` model potential-energy tail :math:`\frac{1}{\beta}\sum_{\mathrm{k}}

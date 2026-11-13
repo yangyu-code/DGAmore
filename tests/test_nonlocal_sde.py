@@ -40,6 +40,7 @@ from dgamore.nonlocal_sde import (
     _init_mu_history,
     _release_shared_giwk,
     get_hartree_fock,
+    get_self_energy_tail_moment,
     perform_ornstein_zernike_fit,
 )
 from dgamore.matsubara_frequencies import MFHelper
@@ -276,6 +277,171 @@ def test_hartree_fock_of_explicit_occupations_equals_the_config_path_and_is_line
     only_b = sum(get_hartree_fock(u_loc, v_nonloc, occ=occ_k_b.mean(axis=(0, 1, 2)), occ_k=occ_k_b))
     assert np.array_equal(explicit, via_config)
     assert np.allclose(both, explicit + only_b, atol=1e-5)
+
+
+def _ring_tail_moment_reference(hop: np.ndarray, w_r: np.ndarray, beta: float, mu: float):
+    """Exact diagonalization of a periodic ring with ``hop[r]`` the orbital hopping matrix from site 0 to site r and
+    ``w_r[r]`` the density-density interaction W_ll'(r), both spin independent. Returns the inputs of
+    get_self_energy_tail_moment and the reference Sigma_1(k) = <{f, f^dagger}> - Sigma_HF^2 of the uncontracted
+    forces f = [c, H_int], all per spin up and in the transform c_k = sum_i e^{-ikr_i} c_i."""
+    n_sites, nb = w_r.shape[:2]
+    n_modes = 2 * n_sites * nb
+    states = np.arange(2**n_modes)
+    c = np.zeros((n_modes, 2**n_modes, 2**n_modes))
+    for m in range(n_modes):
+        occupied = states[(states >> m) & 1 == 1]
+        parity = np.array([bin(s & ((1 << m) - 1)).count("1") % 2 for s in occupied])
+        c[m, occupied ^ (1 << m), occupied] = 1.0 - 2.0 * parity
+
+    def mode(i, orb, spin):
+        return ((i % n_sites) * nb + orb) * 2 + spin
+
+    def number(i, orb, spin):
+        return c[mode(i, orb, spin)].T @ c[mode(i, orb, spin)]
+
+    h_hop = sum(
+        hop[r, a, b] * c[mode(i + r, a, s)].T @ c[mode(i, b, s)]
+        for i in range(n_sites)
+        for r in range(n_sites)
+        for a in range(nb)
+        for b in range(nb)
+        for s in range(2)
+    )
+    h_int = 0.5 * sum(
+        w_r[(j - i) % n_sites, a, b] * c[mode(i, a, s)].T @ c[mode(j, b, t)].T @ c[mode(j, b, t)] @ c[mode(i, a, s)]
+        for i in range(n_sites)
+        for j in range(n_sites)
+        for a in range(nb)
+        for b in range(nb)
+        for s in range(2)
+        for t in range(2)
+    )
+    h = h_hop + h_int - mu * sum(number(i, a, s) for i in range(n_sites) for a in range(nb) for s in range(2))
+    energies, vectors = np.linalg.eigh(h)
+    weights = np.exp(-beta * (energies - energies[0]))
+    rho = (vectors * (weights / weights.sum())) @ vectors.conj().T
+
+    def expect(op):
+        return np.trace(rho @ op)
+
+    up = [mode(i, a, 0) for i in range(n_sites) for a in range(nb)]  # index i * nb + a
+    force = {m: c[m] @ h_int - h_int @ c[m] for m in up}
+    hf = np.array([[expect(force[m] @ c[n].T + c[n].T @ force[m]) for n in up] for m in up])
+    ff = np.array([[expect(force[m] @ force[n].conj().T + force[n].conj().T @ force[m]) for n in up] for m in up])
+    sigma_1_real = ff - hf @ hf
+    rho_1 = np.array([[expect(c[n].T @ c[m]) for n in up] for m in up])  # <c^dagger_n c_m>
+    rho_f = np.array([[expect(c[n].T @ force[m]) for n in up] for m in up])  # <c^dagger_n f_m>
+    dens = [[sum(number(i, a, s) for s in range(2)) for a in range(nb)] for i in range(n_sites)]
+    nn_r = np.array([[[expect(dens[0][a] @ dens[r][b]) for b in range(nb)] for a in range(nb)] for r in range(n_sites)])
+
+    phase = np.exp(-2j * np.pi * np.outer(np.arange(n_sites), np.arange(n_sites)) / n_sites)  # [k, r]
+
+    def bloch(real):  # sum_r e^{-ikr} X[(r, a), (0, b)]
+        blocks = real.reshape(n_sites, nb, n_sites, nb)[:, :, 0, :]
+        return np.einsum("kr,rab->kab", phase, blocks).reshape(n_sites, 1, 1, nb, nb)
+
+    occ_k = bloch(rho_1)
+    inputs = dict(
+        occ=occ_k.mean(axis=(0, 1, 2)),
+        occ_k=occ_k,
+        nn_q=np.einsum("qr,rab->qab", phase, nn_r).reshape(n_sites, 1, 1, nb, nb),
+        force_k=bloch(rho_f),
+    )
+    return inputs, bloch(sigma_1_real).reshape(n_sites, nb, nb)
+
+
+def _ring_interactions(w_r: np.ndarray):
+    """The local and non-local DGAmore interactions of a ring's orbital-diagonal W_ll'(r) (layout U_aabb)."""
+    n_sites, nb = w_r.shape[:2]
+    config.lattice.nk, config.sys.n_bands = (n_sites, 1, 1), nb
+    u = np.zeros((nb, nb, nb, nb), dtype=np.complex128)
+    v = np.zeros((n_sites, nb, nb, nb, nb), dtype=np.complex128)
+    w_q = np.fft.fft(np.where(np.arange(n_sites)[:, None, None] == 0, 0.0, w_r), axis=0)
+    for a in range(nb):
+        for b in range(nb):
+            u[a, a, b, b] = w_r[0, a, b]
+            v[:, a, a, b, b] = w_q[:, a, b]
+    return LocalInteraction(u, SpinChannel.NONE), Interaction(v, SpinChannel.NONE, (n_sites, 1, 1), True)
+
+
+@pytest.mark.parametrize(
+    "n_sites, nb, seed",
+    [(4, 1, 0), (2, 2, 1)],
+)
+def test_self_energy_tail_moment_matches_exact_diagonalization(n_sites, nb, seed):
+    """Sigma_1(k) from the exact occupation, density and force correlations equals the uncontracted force identity
+    of a ring with an orbital-diagonal, inversion-symmetric W and complex (time-reversal breaking) hopping."""
+    rng = np.random.default_rng(seed)
+    w_r = rng.uniform(0.5, 2.0, (n_sites, nb, nb))
+    w_r = w_r + w_r.transpose(0, 2, 1)
+    w_r = 0.5 * (w_r + w_r[(-np.arange(n_sites)) % n_sites])  # W(r) = W(-r)
+    hop = np.zeros((n_sites, nb, nb), dtype=np.complex128)
+    hop[1] = -np.exp(-0.3j) * np.eye(nb) + 0.2 * (rng.standard_normal((nb, nb)) + 1j * rng.standard_normal((nb, nb)))
+    hop[-1] += hop[1].conj().T
+    hop[0] = 0.3 * np.diag(rng.standard_normal(nb))
+    inputs, reference = _ring_tail_moment_reference(hop, w_r, beta=1.3, mu=0.7 * w_r[0].sum())
+
+    u_loc, v_nonloc = _ring_interactions(w_r)
+    sigma_1 = get_self_energy_tail_moment(u_loc, v_nonloc, **inputs)
+
+    assert np.abs(reference).max() > 0.1
+    # the interactions are stored in complex64, so the agreement is single precision
+    assert np.allclose(sigma_1, reference, rtol=0.0, atol=1e-6)
+
+
+def test_self_energy_tail_moment_of_a_single_band_without_v_is_the_hubbard_value_for_any_correlations():
+    """For V = 0 the single-band moment is U^2 n(1 - n) whatever the density and force correlations are."""
+    n_sites, u, n_spin = 4, 3.0, 0.4
+    rng = np.random.default_rng(2)
+    u_loc, v_nonloc = _ring_interactions(np.where(np.arange(n_sites)[:, None, None] == 0, u, 0.0))
+    occ_k = (n_spin + 0.1 * rng.standard_normal(n_sites)).reshape(n_sites, 1, 1, 1, 1)
+    occ_k += n_spin - occ_k.mean()
+    sigma_1 = get_self_energy_tail_moment(
+        u_loc,
+        v_nonloc,
+        occ_k.mean(axis=(0, 1, 2)),
+        occ_k,
+        rng.standard_normal((n_sites, 1, 1, 1, 1)),
+        rng.standard_normal((n_sites, 1, 1, 1, 1)) + 1j * rng.standard_normal((n_sites, 1, 1, 1, 1)),
+    )
+    assert np.allclose(sigma_1, u**2 * n_spin * (1 - n_spin))
+
+
+def test_self_energy_tail_moment_rejects_orbital_off_diagonal_bilinears():
+    """A Hund's exchange element U_abba has an orbital off-diagonal bilinear, which the moment does not support."""
+    u_loc, v_nonloc = _ring_interactions(np.ones((2, 2, 2)))
+    u_loc.mat[0, 1, 1, 0] = 0.5
+    zeros = np.zeros((2, 1, 1, 2, 2))
+    with pytest.raises(NotImplementedError, match="orbital-diagonal"):
+        get_self_energy_tail_moment(u_loc, v_nonloc, zeros[0, 0, 0], zeros, zeros, zeros)
+
+
+def test_log_tail_moment_hands_the_box_sum_of_the_density_susceptibility_to_the_moment(monkeypatch):
+    """The diagnostic sums chi_ccdd over the bosonic box, adds the disconnected q = 0 product of the densities, and
+    logs the deviation from the DMFT moment, whose SelfEnergy sign is Sigma_inf - smom1 / i nu."""
+    nk, nb, nw, beta = (2, 1, 1), 2, 5, 2.0
+    config.lattice.nk, config.sys.n_bands, config.sys.beta = nk, nb, beta
+    config.output.output_path, config.logger = "/run/dir", MagicMock()
+    config.sys.occ = np.diag([0.3, 0.6]).astype(np.complex128)
+    config.sys.occ_k = np.broadcast_to(config.sys.occ, (*nk, nb, nb)).copy()
+    chi_mat = np.random.default_rng(4).standard_normal((2, nw, nb * nb, nb * nb))
+    chi = MagicMock()
+    chi.to_full_niw_range.return_value.map_to_full_bz.return_value.to_compound_indices.return_value.mat = chi_mat
+    captured = {}
+
+    def moment(u_loc, v_nonloc, occ, occ_k, nn_q, force_k):
+        captured["nn_q"] = nn_q
+        return np.zeros((2, nb, nb))
+
+    monkeypatch.setattr(nonlocal_sde.os.path, "exists", MagicMock(return_value=True))
+    monkeypatch.setattr(FourPoint, "load", MagicMock(return_value=chi))
+    monkeypatch.setattr(nonlocal_sde, "get_self_energy_tail_moment", moment)
+    nonlocal_sde._log_tail_moment(None, None, None, MagicMock(smom=(None, -np.eye(nb))))
+
+    expected = 2.0 / beta * chi_mat[:, :, [0, 3]][:, :, :, [0, 3]].sum(axis=1)
+    expected[0] += 2 * np.outer([0.6, 1.2], [0.6, 1.2])
+    assert np.allclose(captured["nn_q"], expected.reshape(*nk, nb, nb))
+    assert "largest deviation 1.0000e+00" in config.logger.info.call_args.args[0]
 
 
 def _constant_chi(mat: np.ndarray):
@@ -2103,7 +2269,7 @@ def test_loop_sums_mu_and_the_occupation_over_the_momenta_picked_for_its_mixed_i
         picked.append((type(sigma), donor.nq, d_irr.ntasks, d_full.ntasks))
         return "rows", d_irr, "wedge"
 
-    def occupy(sigma, donor, d_full, mu, d_irr=None):
+    def occupy(sigma, donor, d_full, mu, d_irr=None, force_k=None):
         occupied.append((mu, d_full.ntasks, None if d_irr is None else d_irr.ntasks))
         return 1.0, np.zeros((1, 1)), np.zeros((1, 1, 1, 1, 1)), 0.0, 0.0
 
@@ -3202,7 +3368,7 @@ def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(mon
     )
     giwk_ref = GreensFunction.get_g_full(sigma_ref, mu, ek, beta)
     _, occ_ref, occ_k_ref = giwk_ref.get_fill_nonlocal()
-    ekin_ref, epot_ref = giwk_ref.get_ekin(), giwk_ref.get_epot()
+    ekin_ref, epot_ref, force_k_ref = giwk_ref.get_ekin(), giwk_ref.get_epot(), giwk_ref.get_force_k()
 
     # one pair of sigmas per fake rank, as every MPI rank holds its own: the update compresses the DMFT sigma in place
     # (flag check, then reshape), so ranks sharing one object race on it
@@ -3210,13 +3376,16 @@ def test_update_occ_and_energies_distributed_matches_the_full_box_evaluation(mon
 
     def fn(comm, rank):
         d_full = mpi_utils.MpiDistributor(ntasks=nk_tot, comm=comm)
-        return nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu)
+        force_k = []
+        result = nonlocal_sde._update_occ_and_energies_distributed(*sigmas[rank], d_full, mu, None, force_k)
+        return (*result, force_k[0])
 
     _, res = run_parallel(2, fn)
     # occupations reproduce the full-box reference bit-for-bit; only the energy scalars regroup their k-sums
-    for _, occ, occ_k, ekin, epot in res:
+    for _, occ, occ_k, ekin, epot, force_k in res:
         assert np.array_equal(occ, occ_ref) and np.array_equal(occ_k, occ_k_ref)
         assert np.allclose([ekin, epot], [ekin_ref, epot_ref], atol=1e-5)
+        assert np.allclose(force_k, force_k_ref, atol=1e-6)
 
 
 @pytest.mark.parametrize("size", [1, 3])
