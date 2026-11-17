@@ -3719,6 +3719,42 @@ def test_sde_tail_moment_is_the_large_frequency_coefficient_of_the_column_contra
     assert np.allclose(sigma.mat, -moments[0][None, ..., None], atol=1e-5)
 
 
+@pytest.mark.parametrize("size", [1, 3])
+def test_ladder_shell_donor_keeps_the_dmft_tail_for_a_local_susceptibility(size, monkeypatch):
+    """At V = 0 a momentum-independent lattice chi equal to the local one cancels the local term of the shift."""
+    monkeypatch.setattr(mpi_utils, "MPI", FAKE_MPI)
+    _column_sde_setup(False)
+    rng = np.random.default_rng(5)
+    o, niw, nk_irr = config.sys.n_bands, config.box.niw_core, config.lattice.k_grid.nk_irr
+    u_loc = LocalInteraction(rng.standard_normal((o,) * 4))
+    v_zero = Interaction(np.zeros((nk_irr,) + (o,) * 4), nq=config.lattice.nk, has_compressed_q_dimension=True)
+    chis = {}
+    for channel in (SpinChannel.DENS, SpinChannel.MAGN):
+        chis[channel] = rng.standard_normal((o,) * 4 + (niw + 1,)) + 1j * rng.standard_normal((o,) * 4 + (niw + 1,))
+        chis[channel][..., 0] = chis[channel][..., 0].real
+    loaded = lambda path, channel, **kwargs: LocalFourPoint(chis[channel].copy(), channel, 1, 0, False)
+    monkeypatch.setattr(LocalFourPoint, "load", staticmethod(loaded))
+
+    def fn(comm, rank):
+        d_irr = mpi_utils.MpiDistributor(ntasks=nk_irr, comm=comm)
+        kernels = []
+        for channel, weight in ((SpinChannel.DENS, 1.0), (SpinChannel.MAGN, 3.0)):
+            chi_q = np.broadcast_to(chis[channel], (nk_irr,) + chis[channel].shape)[d_irr.my_slice].copy()
+            chi_q = FourPoint(chi_q, channel, config.lattice.nk, 1, 0, False, True, True)
+            v_q = Interaction(v_zero.mat[d_irr.my_slice], nq=config.lattice.nk, has_compressed_q_dimension=True)
+            kernels.append(nonlocal_sde.calculate_rpa_kernel_r_q(chi_q, v_q, u_loc).scale(weight))
+        return nonlocal_sde._sde_tail_moment(kernels[0].add(kernels[1], copy=False), d_irr)
+
+    _, moments = run_parallel(size, fn)
+    niv = 6
+    iv = 1j * MFHelper.vn(niv, config.sys.beta)
+    sigma_dmft = SelfEnergy(
+        (0.3 - 0.8 / iv)[None, None, None, None, None] * np.eye(o)[..., None], calc_smom=False, beta=config.sys.beta
+    )
+    donor = nonlocal_sde._ladder_shell_donor(sigma_dmft, moments[0], u_loc)
+    assert np.allclose(donor.mat, sigma_dmft.mat, atol=1e-5)
+
+
 @pytest.mark.parametrize("auto", [False, True])
 def test_column_sde_is_bit_invariant_under_the_round_budget_and_the_contraction_chunk(auto, monkeypatch):
     """With one-column unfold batches, single-task rounds, one-row chunks and the whole block give the same bits."""

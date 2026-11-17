@@ -130,6 +130,7 @@ This section controls the self-consistency cycle.
      previous_sc_path: ""          # str
      use_interpolated_sigma: False # bool
      save_sigma_iterates: True     # bool
+     ladder_tail_shell: False      # bool
 
 The ``max_iter`` field puts an upper limit on the number of iterations; if the self-energy has not converged by
 then, the loop stops and the program exits. The non-local self-energy is written to the output folder for every
@@ -167,6 +168,11 @@ interpolated self-energy of the previous run, with the interpolation itself conf
 :ref:`self-energy interpolation section <self-energy-interpolation>`. Setting ``save_sigma_iterates`` to ``False``
 saves disk space: during the loop only the files of the last ``mixing_history_length + 1`` iterations stay in
 ``Sigma_Iterates``, and after the loop only those of the last iteration, which is all a resumed run reads.
+
+Beyond the core box the self-energy is padded with the DMFT self-energy. With ``ladder_tail_shell`` set to ``True``,
+the :math:`1/i\nu` coefficient of this shell is shifted to that of the ladder self-energy: the DMFT coefficient plus
+the large-:math:`\nu` limit of the lattice Schwinger-Dyson kernel minus that of the local one, so that the shell
+continues the core.
 
 .. _stabilization:
 

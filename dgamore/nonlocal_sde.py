@@ -1246,6 +1246,7 @@ def calculate_sigma_kernel_r_q(
     involution: np.ndarray | None = None,
     static_magn: list | None = None,
     last_chi: dict | None = None,
+    limit_kernels: list | None = None,
 ) -> FourPoint | None:
     r"""
     Adds the kernel for the self-energy calculation in a specific spin channel, times ``weight``, to ``kernel`` in
@@ -1288,6 +1289,8 @@ def calculate_sigma_kernel_r_q(
         :func:`_finish_physical_susceptibility`), or ``None``.
     :param last_chi: Holder of the loop's latest physical susceptibility per channel (see
         :func:`_finish_physical_susceptibility`), or ``None``.
+    :param limit_kernels: Holder that receives the channel kernel's limit at large :math:`\nu`, times ``weight``, or
+        ``None`` to skip it.
     :return: ``kernel``.
     """
     logger = config.logger
@@ -1336,6 +1339,9 @@ def calculate_sigma_kernel_r_q(
         last_chi=last_chi,
     )
     parts = (gchi0_q_full_sum, gchi0_q_core_sum, u_loc, v_nonloc, chi_shell, chi_phys_q_r)
+    if limit_kernels is not None:
+        # the three-leg vertex tends to one at large nu, where the kernel takes its unit-vertex (RPA) form
+        limit_kernels.append(calculate_rpa_kernel_r_q(chi_phys_q_r, v_nonloc, u_loc).scale(weight))
 
     if kernel is not None:
         middle_q_r = create_kernel_middle(x_g, *parts)
@@ -2003,6 +2009,34 @@ def _rpa_shell_donor(moment: np.ndarray, niv: int) -> SelfEnergy:
     """
     iv = 1j * MFHelper.vn(niv, config.sys.beta)
     return SelfEnergy((-moment[..., None] / iv)[None, None, None], calc_smom=False, beta=config.sys.beta)
+
+
+def _ladder_shell_donor(sigma_dmft: SelfEnergy, lattice_moment: np.ndarray, u_loc: LocalInteraction) -> SelfEnergy:
+    r"""
+    Returns the shell donor of ``ladder_tail_shell``: the DMFT self-energy with the coefficient :math:`\Sigma_{1}` of
+    :math:`\Sigma \to \Sigma_{\mathrm{HF}} + \Sigma_{1}/\imath\nu` shifted to that of the ladder self-energy,
+
+    .. math:: \Sigma_{1} = \Sigma^{\mathrm{DMFT}}_{1} + \frac{1}{2\beta N} \sum_{\mathrm{q}} \sum_{r} w_{r}
+        \mathcal{U}^{\mathbf{q}}_{r} \chi^{\mathrm{q}}_{r} \mathcal{U}^{\mathbf{q}}_{r}
+        - \frac{1}{2\beta} \sum_{\omega} \sum_{r} w_{r} U_{r} \chi^{\omega}_{r;\mathrm{loc}} U_{r},
+
+    with :math:`w_{\mathrm{dens}} = 1`, :math:`w_{\mathrm{magn}} = 3`. The local term is the large-:math:`\nu`
+    limit of the local Schwinger-Dyson kernel on the same bosonic box; the derivation assumes that the local part of
+    the lattice Green's function equals the impurity one.
+
+    :param sigma_dmft: The DMFT self-energy supplying the shell frequencies.
+    :param lattice_moment: The lattice term, the coefficient of :math:`-1/\imath\nu` (see :func:`_sde_tail_moment`).
+    :param u_loc: The bare local interaction :math:`U`.
+    :return: The shifted donor :class:`SelfEnergy`.
+    """
+    local_moment = 0.0
+    for channel, weight in ((SpinChannel.DENS, 1.0), (SpinChannel.MAGN, 3.0)):
+        path = os.path.join(config.output.output_path, f"chi_{channel.value}_loc.npy")
+        chi = LocalFourPoint.load(path, channel, num_vn_dimensions=0).cut_niw(config.box.niw_core).to_full_niw_range()
+        u_r = u_loc.as_channel(channel)
+        kernel = (u_r @ chi @ u_r).scale(-weight).permute_orbitals("abcd->badc", copy=False)
+        local_moment = local_moment + np.einsum("abcaw->bc", kernel.mat) / (2.0 * config.sys.beta)
+    return sigma_dmft + _rpa_shell_donor(lattice_moment - local_moment, sigma_dmft.niv)
 
 
 def _sde_chunk_budget(comm: MPI.Comm, shared_node_comm) -> int:
@@ -2719,6 +2753,7 @@ def calculate_sigma_proposal(
     lambda_previous: dict | None = None,
     static_magn: list | None = None,
     last_chi: dict | None = None,
+    shell_donor: list | None = None,
 ) -> SelfEnergy | None:
     r"""
     Returns the raw (un-mixed) DGA self-energy proposal :math:`S(\Sigma_{\mathrm{in}})` at chemical potential
@@ -2775,6 +2810,8 @@ def calculate_sigma_proposal(
         :func:`_finish_physical_susceptibility`), or ``None``.
     :param last_chi: Holder of the loop's latest physical susceptibility per channel (see
         :func:`_finish_physical_susceptibility`), or ``None``.
+    :param shell_donor: Holder that receives on rank 0 the shell donor of ``ladder_tail_shell`` (see
+        :func:`_ladder_shell_donor`), so the loop pads its iterate with the same tail, or ``None``.
     :return: The raw full-BZ proposal :class:`SelfEnergy` (DMFT tail attached) on rank 0; ``None`` on every other rank,
         since only rank 0 mixes it, and on every rank with ``eliashberg_only``.
     """
@@ -2883,6 +2920,7 @@ def calculate_sigma_proposal(
 
         if save_eliashberg:
             gchi0_q_core_inv.save(name=f"gchi0_q_inv_rank_{comm.rank}", output_dir=config.output.eliashberg_path)
+        limit_kernels = [] if kernel is not None and config.self_consistency.ladder_tail_shell else None
 
         if involution is not None and current_iter == 1:
             logger.info(
@@ -2907,6 +2945,7 @@ def calculate_sigma_proposal(
             kernel=kernel,
             involution=involution,
             last_chi=last_chi,
+            limit_kernels=limit_kernels,
         )
         gamma_dens.mat = None
         if gamma_dens_win is None:
@@ -2934,7 +2973,10 @@ def calculate_sigma_proposal(
             involution=involution,
             static_magn=static_magn,
             last_chi=last_chi,
+            limit_kernels=limit_kernels,
         )
+        if limit_kernels is not None:
+            tail_moment = _sde_tail_moment(limit_kernels[0].add(limit_kernels[1], copy=False), mpi_dist_irrk)
         gchi0_q_core_inv.free()
         gchi0_q_full_sum.free()
         gchi0_q_core_sum.free()
@@ -2997,6 +3039,10 @@ def calculate_sigma_proposal(
         if config.misc.do_rpa:
             # RPA mode carries no DMFT self-energy: its shell is the whole Hartree-Fock term and the kernels' 1/iv tail
             donor, shell_offset = _rpa_shell_donor(tail_moment, sigma_dmft.niv), (hartree + fock)[..., 0]
+        elif tail_moment is not None:
+            donor = _ladder_shell_donor(sigma_dmft, tail_moment, u_loc)
+            if shell_donor is not None:
+                shell_donor[:] = [donor]
         # the one-sided SDE breaks Sigma(-k) = Sigma(k)^T for several orbitals; the average is the two-sided SDE
         average = sigma_prop.n_bands > 1 and _has_time_reversal(config.lattice.hamiltonian.get_ek())
     # a grid whose contraction averages over a point group gets the core of a proposal that obeys the group unfolded
@@ -3678,6 +3724,7 @@ def calculate_self_energy_q(
     pure_converged = False
     static_magn = []  # rank 0: the static magnetic susceptibility of the latest proposal, fitted after the loop
     last_chi = {}  # every rank: its momenta of the latest physical susceptibilities, written after the loop
+    shell_donor = []  # rank 0: the shell donor of the latest proposal with ladder_tail_shell
     # rank 0 writes each iterate in the background while the next proposal runs; the write reads the shared window
     # of the iterate, so it is awaited before that window is freed
     saver = ThreadPoolExecutor(max_workers=1) if comm.rank == 0 else None
@@ -3720,6 +3767,7 @@ def calculate_self_energy_q(
             lambda_previous=lambda_previous,
             static_magn=static_magn,
             last_chi=last_chi,
+            shell_donor=shell_donor,
         )
         # delta_sigma = sigma_dmft.cut_niv(config.box.niv_core) - sigma_new.q_mean().cut_niv(config.box.niv_core)
         # the map's own distance from a fixed point and the change of the proposal, read before the mixing overwrites it
@@ -3754,7 +3802,8 @@ def calculate_self_energy_q(
 
         # only rank 0 mixes and measures the residual, so only rank 0 keeps a private copy of the previous iterate
         # (the cut copies everything still needed from the previous iteration's shared sigma buffer)
-        donor = sigma_dmft
+        # the iterate is padded with the proposal's tail, so a mixture of the two carries it fully
+        donor = shell_donor[0] if shell_donor else sigma_dmft
         if comm.rank == 0 and config.misc.do_rpa:
             # RPA mode pads with its own tail again, whose moments the outermost frequency holds exactly
             donor = _rpa_shell_donor(sigma_old.fit_smom(n_freq=1)[1], sigma_dmft.niv)

@@ -25,6 +25,7 @@ self_consistency:
   # the code will start from the last iteration of the previous calculation and does max_iter steps on top
   use_interpolated_sigma: False # If True, the code will use the interpolated self-energy from the previous iteration
   save_sigma_iterates: True # If False, only the last mixing_history_length + 1 iterates are kept during the loop and only the last one after it. Default: True
+  ladder_tail_shell: False # If True, the shell beyond the core box carries the 1/iv coefficient of the ladder self-energy instead of the DMFT one. Default: False
 
 stabilization:
   use_lambda_correction: False # If True, applies the Moriya lambda correction in every iteration as a releasing scaffold (correction on until convergence at 10x epsilon,

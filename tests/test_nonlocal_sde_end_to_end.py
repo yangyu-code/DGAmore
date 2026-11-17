@@ -357,6 +357,30 @@ def test_rpa_mode_takes_its_shell_moment_from_the_kernel_the_sde_contracts(setup
     assert np.allclose(s_1, seen["moment"][None, :, :, None], atol=1e-4 * np.abs(seen["moment"]).max())
 
 
+def test_ladder_tail_shell_shifts_the_shell_moment_by_a_local_constant_that_the_mixing_keeps(setup):
+    """With ladder_tail_shell the shell moment moves by one k- and v-independent amount, the same after mixing."""
+    folder, comm_mock = setup
+    config.box.niw_core, config.box.niv_core, config.box.niv_shell = 20, 20, 10
+    shifts = []
+    for mixing in (1.0, 0.5):
+        config.self_consistency.mixing = mixing
+        moments = []
+        for on in (False, True):
+            _, s_dmft, _, _ = tuple(x[0] for x in dga_io.load_from_dmft_file_and_update_config())
+            config.sys.occ_dmft = config.sys.occ_dmft_per_ineq[0]
+            config.output.output_path = folder
+            config.self_consistency.ladder_tail_shell = on
+            u_loc = config.lattice.hamiltonian.get_local_u()
+            v_nonloc = config.lattice.hamiltonian.get_vq(config.lattice.k_grid)
+            sigma = nonlocal_sde.calculate_self_energy_q(comm_mock, u_loc, v_nonloc, s_dmft.copy(), s_dmft.copy())
+            moments.append(_shell_moment(sigma.compress_q_dimension().mat, config.box.niv_core))
+        shifts.append(moments[1] - moments[0])
+    shift = shifts[0]
+    assert np.abs(shift).max() > 1e-3
+    assert np.allclose(shift, shift[:1, ..., :1], atol=1e-4 * np.abs(shift).max())
+    assert np.allclose(shifts[1], shift, atol=1e-4 * np.abs(shift).max())
+
+
 def test_rpa_mode_below_its_stoner_pole_has_a_causal_self_energy(setup, monkeypatch):
     """At a quarter of the fixture's interaction, below the Stoner pole, Im Sigma < 0 at every k and v > 0."""
     folder, comm_mock = setup

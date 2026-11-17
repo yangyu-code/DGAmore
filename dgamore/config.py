@@ -126,6 +126,9 @@ class SelfConsistencyConfig:
         but the last iteration's.
     :ivar str sigma_iterates_subfolder_name: Subfolder name (under the output path) for the per-iteration
         self-energies the loop writes; the resolved directory is :attr:`OutputConfig.sigma_iterates_path`.
+    :ivar bool ladder_tail_shell: Whether the shell beyond the core box carries the :math:`1/\imath\nu` coefficient of
+        the ladder self-energy, :math:`\Sigma^{\mathrm{DMFT}}_1` plus the lattice minus the local
+        :math:`\mathcal{U}\chi\mathcal{U}` term, instead of the DMFT one.
     """
 
     def __init__(self):
@@ -137,6 +140,7 @@ class SelfConsistencyConfig:
         self.previous_sc_path: str = ""
         self.use_interpolated_sigma: bool = False
         self.save_sigma_iterates: bool = True
+        self.ladder_tail_shell: bool = False
         self.sigma_iterates_subfolder_name: str = "Sigma_Iterates"
 
 
